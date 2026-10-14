@@ -607,8 +607,9 @@ fn run_cli() {
     let ign_enriched = ign_buildings.apply(&mut parsed_elements);
     if ign_enriched.heights > 0 {
         println!(
-            "  Filled heights on {} OSM buildings from IGN BD TOPO",
-            ign_enriched.heights.to_string().bright_white().bold()
+            "  Filled heights on {} OSM buildings from IGN data ({} read from the LiDAR under their own footprint)",
+            ign_enriched.heights.to_string().bright_white().bold(),
+            ign_enriched.lidar_heights
         );
     }
     if ign_enriched.roofs > 0 {

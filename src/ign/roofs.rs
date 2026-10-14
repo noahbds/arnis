@@ -170,6 +170,48 @@ pub struct Roof {
     pub rise_m: f64,
 }
 
+/// Below this a height-model cell is ground, a car or a hedge, not a roof.
+const MIN_ROOF_M: f64 = 2.0;
+/// Share of a footprint's cells that must be roof for its heights to count:
+/// less, and the footprint holds a courtyard, a demolished building or a
+/// misdrawn outline.
+const MIN_ROOF_SHARE: f64 = 0.7;
+/// Taller than this is a church spire or a misreading, left to the BD TOPO.
+const MAX_HEIGHT_M: f64 = 60.0;
+
+/// One building's own heights, read under its own footprint.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Measured {
+    /// Gutter height above the ground beside the building.
+    pub eave_m: f64,
+    /// Highest part of the roof above the same ground.
+    pub top_m: f64,
+}
+
+/// Gutter and top heights of the building over these interior points. The
+/// BD TOPO gives one height to a whole terrace it draws as one object; the
+/// height model tells each house in it apart.
+pub fn measure(points: &[(f64, f64)], heights: &SurfaceHeights) -> Option<Measured> {
+    let valid: Vec<f64> = points
+        .iter()
+        .filter_map(|&(x, z)| heights.at(x, z))
+        .collect();
+    if valid.len() < MIN_SAMPLES || (valid.len() as f64) < 0.6 * points.len() as f64 {
+        return None;
+    }
+    let mut roof: Vec<f64> = valid.iter().copied().filter(|&h| h >= MIN_ROOF_M).collect();
+    if (roof.len() as f64) < MIN_ROOF_SHARE * valid.len() as f64 {
+        return None;
+    }
+    roof.sort_by(f64::total_cmp);
+    let pct = |q: f64| roof[((roof.len() - 1) as f64 * q).round() as usize];
+    let (eave, top) = (pct(0.1), pct(0.95));
+    (top <= MAX_HEIGHT_M).then_some(Measured {
+        eave_m: eave,
+        top_m: top,
+    })
+}
+
 /// Reads the roof over the given interior points of a footprint.
 pub fn classify(points: &[(f64, f64)], heights: &SurfaceHeights) -> Option<Roof> {
     let samples: Vec<(f64, f64, f64)> = points
@@ -391,6 +433,28 @@ mod tests {
         assert_eq!(roof.shape, "skillion");
         let bearing = roof.direction.unwrap();
         assert!((260..=280).contains(&bearing), "bearing {bearing}");
+    }
+
+    #[test]
+    fn each_house_of_a_terrace_gets_its_own_height() {
+        // Two houses side by side: gutters at 6 m and 9 m, ridges 3 m higher.
+        let heights = SurfaceHeights::from_fn(40, 40, |x, z| {
+            let ridge_distance = (z as f32 + 0.5 - 10.0).abs() / 5.0;
+            let eave = if x < 20 { 6.0 } else { 9.0 };
+            eave + 3.0 * (1.0 - ridge_distance)
+        });
+        let left = measure(&points(5, 5, 15, 15), &heights).unwrap();
+        let right = measure(&points(25, 5, 35, 15), &heights).unwrap();
+        assert!((left.eave_m - 6.6).abs() < 0.6, "{left:?}");
+        assert!((right.eave_m - 9.6).abs() < 0.6, "{right:?}");
+        assert!((right.top_m - 12.0).abs() < 0.5, "{right:?}");
+    }
+
+    #[test]
+    fn a_footprint_over_open_ground_gives_no_height() {
+        // A courtyard or a demolished house: mostly ground under the outline.
+        let heights = SurfaceHeights::from_fn(40, 40, |x, _| if x < 8 { 7.0 } else { 0.2 });
+        assert_eq!(measure(&points(5, 5, 25, 15), &heights), None);
     }
 
     #[test]

@@ -288,6 +288,9 @@ struct Hint {
 pub struct Enriched {
     /// Given a height or storey count.
     pub heights: usize,
+    /// Of those, the ones whose height was read from the LiDAR under their
+    /// own footprint rather than taken from the BD TOPO.
+    pub lidar_heights: usize,
     /// Given a type, a material or a construction year.
     pub looks: usize,
     /// Given a roof shape read from the LiDAR.
@@ -374,13 +377,17 @@ impl IgnBuildings {
                 .as_ref()
                 .filter(|_| wants_roof)
                 .and_then(|surface| super::roofs::classify(&footprint.interior_samples(), surface));
-            let hint = match (self.hint_for(&footprint, &index), roof) {
-                (Some(hint), _) => hint,
-                // The LiDAR alone still gives the roof.
-                (None, Some(_)) => Hint::default(),
-                (None, None) => continue,
+            let measured = self
+                .surface
+                .as_ref()
+                .filter(|_| wants_height)
+                .and_then(|surface| super::roofs::measure(&footprint.interior_samples(), surface));
+            let hint = match (self.hint_for(&footprint, &index), roof, measured) {
+                (Some(hint), _, _) => hint,
+                // The LiDAR alone still gives the roof and the height.
+                (None, Some(_), _) | (None, _, Some(_)) => Hint::default(),
+                (None, None, None) => continue,
             };
-
             let tags: &mut HashMap<String, String> = match element {
                 ProcessedElement::Way(way) => &mut way.tags,
                 ProcessedElement::Relation(relation) => &mut relation.tags,
@@ -407,7 +414,24 @@ impl IgnBuildings {
                 tags.insert("arnis:roof_source".to_string(), "ign_lidar_hd".to_string());
                 enriched.roofs += 1;
             }
+            // Measured under this very footprint, it beats the height the BD
+            // TOPO spreads over a whole terrace.
+            let mut from_lidar = false;
+            if let Some(measured) = measured {
+                hint.eave_height_m = Some(measured.eave_m);
+                if hint.roof_rise_m.is_none() || roof.is_none() {
+                    hint.roof_rise_m = Some(measured.top_m - measured.eave_m);
+                }
+                from_lidar = true;
+            }
             if wants_height && write_tags(tags, hint) {
+                if from_lidar {
+                    tags.insert(
+                        "arnis:height_source".to_string(),
+                        "ign_lidar_hd".to_string(),
+                    );
+                    enriched.lidar_heights += 1;
+                }
                 enriched.heights += 1;
             }
             if write_looks(tags, hint.looks) {
@@ -1031,7 +1055,8 @@ mod tests {
                 heights: 1,
                 looks: 2,
                 roofs: 0,
-                roof_colours: 0
+                roof_colours: 0,
+                lidar_heights: 0
             }
         );
         assert_eq!(tag(&elements[0], "building"), Some("house"));
