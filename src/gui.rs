@@ -1723,6 +1723,8 @@ fn gui_start_generation(
                 max_tree_size: crate::trees::tree_library::TreeSize::from_str_lossy(&max_tree_size),
                 canopy_height: canopy_height_enabled,
                 overture: overture_enabled,
+                // No setting yet: it only acts inside France, and only adds heights.
+                ign: true,
                 // Auto picks whichever transport is cheaper for the area. The
                 // two are not bit-identical - tiles quantise coordinates to a
                 // 0.4 m lattice and keep the largest ring of a multipolygon the
@@ -1933,7 +1935,18 @@ fn gui_start_generation(
             }
 
             // OSM, Overture and elevation/land-cover fetches only need the bbox, run them in parallel
-            let (fetch_result, overture_data, ground) = std::thread::scope(|s| {
+            let (fetch_result, overture_data, ign_data, ground) = std::thread::scope(|s| {
+                let ign_handle = s.spawn(|| {
+                    if args.ign {
+                        crate::ign::fetch_ign_data(
+                            &bbox,
+                            &crate::projection::ProjectionSpec::from_args(&args),
+                            args.debug,
+                        )
+                    } else {
+                        crate::ign::IgnData::default()
+                    }
+                });
                 let overture_handle = s.spawn(|| {
                     if args.overture {
                         overture::fetch_overture_buildings(
@@ -1962,7 +1975,17 @@ fn gui_start_generation(
                     eprintln!("Overture fetch failed, continuing without Overture buildings.");
                     overture::OvertureData::default()
                 });
-                (fetch_result, overture_data, ground_handle.join().ok())
+                // Supplementary like Overture: without it the heights are inferred.
+                let ign_data = ign_handle.join().unwrap_or_else(|_| {
+                    eprintln!("IGN fetch failed, continuing without IGN data.");
+                    crate::ign::IgnData::default()
+                });
+                (
+                    fetch_result,
+                    overture_data,
+                    ign_data,
+                    ground_handle.join().ok(),
+                )
             });
 
             let Some(ground) = ground else {
@@ -1987,6 +2010,9 @@ fn gui_start_generation(
                         elements: overture_elements,
                         hints: overture_hints,
                     } = overture_data;
+
+                    // Measured IGN heights first, then Overture for what is left
+                    ign_data.buildings.apply(&mut parsed_elements);
 
                     // Fill height/levels on OSM buildings that have neither
                     overture_hints.apply(&mut parsed_elements);

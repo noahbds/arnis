@@ -161,6 +161,11 @@ pub struct Args {
     #[arg(long = "overture-source", value_enum, default_value_t = OvertureSource::Auto)]
     pub overture_source: OvertureSource,
 
+    /// In France, take building heights from the IGN BD TOPO where OpenStreetMap
+    /// has none. Has no effect elsewhere: nothing is requested outside France.
+    #[arg(long = "ign", default_value_t = true, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub ign: bool,
+
     /// Disable both external 3D models (3DMR + Wikimedia) and bundled schematic
     /// props (cars, boats, cranes, ...) with a single toggle.
     #[arg(long = "no-3d", default_value_t = true, action = ArgAction::SetFalse)]

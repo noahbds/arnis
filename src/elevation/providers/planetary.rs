@@ -157,6 +157,7 @@ impl ElevationProvider for PlanetaryDem {
 
         Ok(RawElevationGrid {
             heights_meters: heights,
+            survey: None,
         })
     }
 }

@@ -196,12 +196,16 @@ pub fn repair_terrain_anomalies(heights: &mut [Vec<f64>], m_per_cell: f64) {
 /// pull-down reaches into built-up shorelines. This counteracts the DSM
 /// building-height bias at the waterfront that a Gaussian alone would turn
 /// into a visible "rising ramp" between water and the city interior.
+///
+/// `measured` marks cells taken from a survey known to be bare earth already;
+/// the built-up smoothing and the coastal pull leave those cells as they are.
 pub fn apply_land_cover_repair(
     heights: &mut [Vec<f64>],
     land_cover: &mut LandCoverData,
     built_up_sigma_cells: f64,
     coastal_pull_distance_cells: u32,
     m_per_cell: f64,
+    measured: Option<&[Vec<bool>]>,
     report: &dyn Fn(f64),
 ) {
     let grid_h = heights.len();
@@ -257,12 +261,27 @@ pub fn apply_land_cover_repair(
         heights,
         &land_cover.grid,
         &is_water_surface,
+        measured,
         built_up_sigma_cells,
         report,
     );
     if coastal_pull_distance_cells > 0 {
-        pull_coastal_land_toward_water(heights, &is_water_surface, coastal_pull_distance_cells);
+        pull_coastal_land_toward_water(
+            heights,
+            &is_water_surface,
+            measured,
+            coastal_pull_distance_cells,
+        );
     }
+}
+
+fn is_measured(measured: Option<&[Vec<bool>]>, x: usize, y: usize) -> bool {
+    measured.is_some_and(|m| {
+        m.get(y)
+            .and_then(|row| row.get(x))
+            .copied()
+            .unwrap_or(false)
+    })
 }
 
 /// Flatten the water surface of each connected `LC_WATER` component and
@@ -1918,6 +1937,7 @@ fn reclassify_non_surface_water_cells(
 fn pull_coastal_land_toward_water(
     heights: &mut [Vec<f64>],
     is_water_surface: &[Vec<bool>],
+    measured: Option<&[Vec<bool>]>,
     max_distance: u32,
 ) {
     if max_distance == 0 {
@@ -1975,7 +1995,8 @@ fn pull_coastal_land_toward_water(
     for y in 0..h {
         for x in 0..w {
             let d = dist[y][x];
-            if d == 0 || d > max_distance {
+            // A surveyed quay or cliff foot is the real shore, not a DSM artefact.
+            if d == 0 || d > max_distance || is_measured(measured, x, y) {
                 continue;
             }
             let wl = water_level[y][x];
@@ -2023,11 +2044,19 @@ fn smooth_built_up_gaussian(
     heights: &mut [Vec<f64>],
     lc_grid: &[Vec<u8>],
     is_water_surface: &[Vec<bool>],
+    measured: Option<&[Vec<bool>]>,
     sigma_cells: f64,
     report: &dyn Fn(f64),
 ) {
     const MIN_SIGMA: f64 = 1.5;
     if sigma_cells < MIN_SIGMA {
+        return;
+    }
+    // Nothing to repair when every cell already comes from a bare-earth survey.
+    if measured.is_some_and(|m| m.iter().all(|row| row.iter().all(|&v| v))) {
+        eprintln!(
+            "Land cover repair: built-up smoothing skipped, the whole area is surveyed bare earth"
+        );
         return;
     }
 
@@ -2069,7 +2098,7 @@ fn smooth_built_up_gaussian(
     let mut total_influenced = 0usize;
     for y in 0..h {
         for x in 0..w {
-            if is_water_surface[y][x] {
+            if is_water_surface[y][x] || is_measured(measured, x, y) {
                 continue;
             }
             let m = (feathered_mask[y][x] as f64).clamp(0.0, 1.0);
@@ -4049,5 +4078,59 @@ mod affine_policy_tests {
         assert_eq!(mc[0][1], -1594.0);
         assert_eq!(mc[0][2], -1064.0);
         assert!(mc[1][0] < mc[1][1] && mc[1][1] < mc[1][2] && mc[1][2] <= 2016.0);
+    }
+}
+
+#[cfg(test)]
+mod survey_tests {
+    use super::*;
+
+    /// A built-up square with a 10 m mound in the middle, no water.
+    fn mound(w: usize) -> (Vec<Vec<f64>>, Vec<Vec<u8>>, Vec<Vec<bool>>) {
+        let mut heights = vec![vec![0.0; w]; w];
+        heights[w / 2][w / 2] = 10.0;
+        (
+            heights,
+            vec![vec![LC_BUILT_UP; w]; w],
+            vec![vec![false; w]; w],
+        )
+    }
+
+    #[test]
+    fn the_built_up_smoothing_leaves_surveyed_cells_alone() {
+        let w = 41;
+        let (mut smoothed, lc, water) = mound(w);
+        smooth_built_up_gaussian(&mut smoothed, &lc, &water, None, 5.0, &|_| {});
+        assert!(
+            smoothed[w / 2][w / 2] < 5.0,
+            "the mound should be flattened"
+        );
+
+        let (mut kept, lc, water) = mound(w);
+        let mut surveyed = vec![vec![false; w]; w];
+        surveyed[w / 2][w / 2] = true;
+        smooth_built_up_gaussian(&mut kept, &lc, &water, Some(&surveyed), 5.0, &|_| {});
+        assert_eq!(kept[w / 2][w / 2], 10.0);
+        // Its unsurveyed neighbours are still blended.
+        assert!(kept[w / 2][w / 2 + 1] > 0.0);
+    }
+
+    #[test]
+    fn the_coastal_pull_keeps_a_surveyed_quay() {
+        // Water in the first column, a 5 m quay right beside it.
+        let w = 10;
+        let mut heights = vec![vec![5.0; w]; 3];
+        let mut water = vec![vec![false; w]; 3];
+        for row in 0..3 {
+            heights[row][0] = 0.0;
+            water[row][0] = true;
+        }
+        let mut pulled = heights.clone();
+        pull_coastal_land_toward_water(&mut pulled, &water, None, 5);
+        assert!(pulled[1][1] < 5.0, "an unsurveyed quay is ramped down");
+
+        let surveyed = vec![vec![true; w]; 3];
+        pull_coastal_land_toward_water(&mut heights, &water, Some(&surveyed), 5);
+        assert_eq!(heights[1][1], 5.0);
     }
 }

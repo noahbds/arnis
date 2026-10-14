@@ -5,6 +5,10 @@ use crate::coordinate_system::geographic::LLBBox;
 pub struct RawElevationGrid {
     /// Height values in meters above sea level. NaN for missing data.
     pub heights_meters: Vec<Vec<f64>>,
+    /// Same layout as `heights_meters`: true where the cell was sampled from a
+    /// national survey rather than a global surface model. `None` when the
+    /// provider cannot tell, which keeps every repair pass on.
+    pub survey: Option<Vec<Vec<bool>>>,
 }
 
 /// Trait for elevation data providers.

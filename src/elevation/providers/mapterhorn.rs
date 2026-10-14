@@ -22,6 +22,9 @@ const TERRARIUM_OFFSET: f64 = 32768.0;
 const MAX_ZOOM: u8 = 17;
 /// Pyramid floor; any land tile exists at z6, only mid-ocean is absent there.
 const MIN_ZOOM: u8 = 6;
+/// The global GLO-30 layer stops at z12; anything finer comes from a national
+/// survey (LiDAR or a national terrain model, about 6 m per pixel or better).
+const SURVEY_MIN_ZOOM: u8 = 13;
 const MAX_CONCURRENT_DOWNLOADS: usize = 8;
 /// Grid rows sampled per chunk; bounds decoded tiles to a few tile rows.
 const SAMPLE_CHUNK_ROWS: usize = 1024;
@@ -89,10 +92,12 @@ impl ElevationProvider for Mapterhorn {
             grid_height
         );
 
-        let height_grid = sample_grid(bbox, zoom, &outcome, &cache_dir, grid_width, grid_height);
+        let (height_grid, survey) =
+            sample_grid(bbox, zoom, &outcome, &cache_dir, grid_width, grid_height);
 
         Ok(RawElevationGrid {
             heights_meters: height_grid,
+            survey: Some(survey),
         })
     }
 }
@@ -592,6 +597,9 @@ fn norm_y_for_lat(lat: f64) -> f64 {
 
 /// Sample the grid in row chunks, decoding only the tiles each chunk needs,
 /// so decoded-tile memory stays at a few tile rows instead of the whole fetch.
+///
+/// Also returns, per cell, whether its value came from a national survey
+/// (zoom [`SURVEY_MIN_ZOOM`] or finer) rather than the global floor.
 fn sample_grid(
     bbox: &LLBBox,
     zoom: u8,
@@ -599,9 +607,10 @@ fn sample_grid(
     cache_dir: &Path,
     grid_width: usize,
     grid_height: usize,
-) -> Vec<Vec<f64>> {
+) -> (Vec<Vec<f64>>, Vec<Vec<bool>>) {
     let floor = MIN_ZOOM.min(zoom);
     let mut height_grid: Vec<Vec<f64>> = Vec::with_capacity(grid_height);
+    let mut survey_grid: Vec<Vec<bool>> = Vec::with_capacity(grid_height);
     let mut unreadable: FnvHashSet<TileKey> = FnvHashSet::default();
 
     for chunk_start in (0..grid_height).step_by(SAMPLE_CHUNK_ROWS) {
@@ -618,12 +627,13 @@ fn sample_grid(
             &mut unreadable,
         );
 
-        let mut rows: Vec<Vec<f64>> = (chunk_start..chunk_end)
+        let rows: Vec<(Vec<f64>, Vec<bool>)> = (chunk_start..chunk_end)
             .into_par_iter()
             .map(|gy| {
                 let lat = row_lat(bbox, gy, grid_height);
                 let norm_y = norm_y_for_lat(lat);
                 let mut row = vec![f64::NAN; grid_width];
+                let mut survey_row = vec![false; grid_width];
                 for (gx, cell) in row.iter_mut().enumerate() {
                     let lng = bbox.min().lng()
                         + (gx as f64 / (grid_width - 1).max(1) as f64)
@@ -631,7 +641,10 @@ fn sample_grid(
                     let norm_x = (lng + 180.0) / 360.0;
 
                     *cell = match sample_height(&tiles, zoom, norm_x, norm_y) {
-                        Some(v) => v,
+                        Some((v, z)) => {
+                            survey_row[gx] = z >= SURVEY_MIN_ZOOM;
+                            v
+                        }
                         // Confirmed-404 floor ancestor means ocean (0.0);
                         // otherwise a download failed and NaN lets the caller judge.
                         None => {
@@ -644,13 +657,16 @@ fn sample_grid(
                         }
                     };
                 }
-                row
+                (row, survey_row)
             })
             .collect();
-        height_grid.append(&mut rows);
+        for (row, survey_row) in rows {
+            height_grid.push(row);
+            survey_grid.push(survey_row);
+        }
     }
 
-    height_grid
+    (height_grid, survey_grid)
 }
 
 /// Decode the available tiles a row chunk can touch, across all pyramid levels.
@@ -704,13 +720,14 @@ fn load_chunk_tiles(
     tiles
 }
 
-/// Bilinear sample walking the pyramid top-down; None means no tile covers it.
+/// Bilinear sample walking the pyramid top-down, with the zoom it came from;
+/// None means no tile covers it.
 fn sample_height(
     tiles: &FnvHashMap<TileKey, TileImage>,
     top_zoom: u8,
     norm_x: f64,
     norm_y: f64,
-) -> Option<f64> {
+) -> Option<(f64, u8)> {
     let floor = MIN_ZOOM.min(top_zoom);
     for z in (floor..=top_zoom).rev() {
         let key = tile_key_at(z, norm_x, norm_y);
@@ -744,7 +761,7 @@ fn sample_height(
         // NaN corners (absent neighbor tiles) drop out of the blend weighting.
         let value = blend_finite_samples(v00, v10, v01, v11, dx, dy);
         if value.is_finite() {
-            return Some(value);
+            return Some((value, z));
         }
     }
     None
@@ -882,7 +899,7 @@ mod tests {
         );
         let norm_x = (2138.0 + 0.5) / 4096.0;
         let norm_y = (1430.0 + 0.5) / 4096.0;
-        let v = sample_height(&tiles, 12, norm_x, norm_y).unwrap();
+        let (v, _) = sample_height(&tiles, 12, norm_x, norm_y).unwrap();
         assert!((v - 1000.0).abs() < 0.51, "got {v}");
     }
 
@@ -899,7 +916,7 @@ mod tests {
         );
         let norm_x = (2138.0 + 0.5) / 4096.0;
         let norm_y = (1430.0 + 0.5) / 4096.0;
-        let v = sample_height(&tiles, 12, norm_x, norm_y).unwrap();
+        let (v, _) = sample_height(&tiles, 12, norm_x, norm_y).unwrap();
         assert!((v - 250.0).abs() < 0.51, "got {v}");
     }
 
@@ -935,7 +952,7 @@ mod tests {
         };
 
         // 2500 rows forces three sampling chunks.
-        let grid = sample_grid(&bbox, 8, &outcome, tmp.path(), 64, 2500);
+        let (grid, _) = sample_grid(&bbox, 8, &outcome, tmp.path(), 64, 2500);
         assert_eq!(grid.len(), 2500);
         for row in &grid {
             for &v in row {
@@ -963,7 +980,7 @@ mod tests {
             failed_downloads: 0,
         };
 
-        let grid = sample_grid(&bbox, 6, &outcome, tmp.path(), 32, 2500);
+        let (grid, _) = sample_grid(&bbox, 6, &outcome, tmp.path(), 32, 2500);
         assert!(
             (grid[0][0] - 300.0).abs() < 0.51,
             "north row got {}",
@@ -994,7 +1011,7 @@ mod tests {
             confirmed_missing,
             failed_downloads: 0,
         };
-        let grid = sample_grid(&bbox, 8, &ocean, tmp.path(), 8, 8);
+        let (grid, _) = sample_grid(&bbox, 8, &ocean, tmp.path(), 8, 8);
         assert!(grid.iter().flatten().all(|v| *v == 0.0));
 
         let failed = FetchOutcome {
@@ -1002,7 +1019,7 @@ mod tests {
             confirmed_missing: FnvHashSet::default(),
             failed_downloads: 3,
         };
-        let grid = sample_grid(&bbox, 8, &failed, tmp.path(), 8, 8);
+        let (grid, _) = sample_grid(&bbox, 8, &failed, tmp.path(), 8, 8);
         assert!(grid.iter().flatten().all(|v| v.is_nan()));
     }
 

@@ -220,6 +220,15 @@ pub fn fetch_elevation_data(
     bench.mark("elev_raw_fetch");
     emit_gui_progress_update(12.0, "Processing elevation...");
 
+    // Cells known to be bare earth already, which the DSM repairs below would
+    // only damage. Measured against the IGN LiDAR in France (the smoothing cost
+    // up to a fifth of the ground its metre of accuracy); elsewhere the national
+    // surveys have not been checked, so they keep the repairs.
+    let survey = raw
+        .survey
+        .filter(|_| crate::ign::may_be_covered(bbox))
+        .filter(|grid| grid.iter().any(|row| row.iter().any(|&v| v)));
+
     // Shared post-processing pipeline
     let mut height_grid = raw.heights_meters;
     let (bbox_height_m, bbox_width_m) = geo_distance(bbox.min(), bbox.max());
@@ -261,10 +270,14 @@ pub fn fetch_elevation_data(
     // cliff with stepped stone walls.
     const BUILT_UP_SIGMA_M: f64 = 30.0;
     const COASTAL_PULL_M: f64 = 25.0;
+    // Measurement hooks: let a run override either scale (0 switches the pass off)
+    // so its share of the terrain error can be measured in isolation.
+    let built_up_sigma_m = metres_override("ARNIS_BUILT_UP_SIGMA_M").unwrap_or(BUILT_UP_SIGMA_M);
+    let coastal_pull_m = metres_override("ARNIS_COASTAL_PULL_M").unwrap_or(COASTAL_PULL_M);
     let (built_up_sigma_cells, coastal_pull_cells) = if m_per_cell > 0.0 {
         (
-            BUILT_UP_SIGMA_M / m_per_cell,
-            (COASTAL_PULL_M / m_per_cell).round() as u32,
+            built_up_sigma_m / m_per_cell,
+            (coastal_pull_m / m_per_cell).round() as u32,
         )
     } else {
         (0.0, 0)
@@ -279,6 +292,7 @@ pub fn fetch_elevation_data(
             built_up_sigma_cells,
             coastal_pull_cells,
             m_per_cell,
+            survey.as_deref(),
             &|f| emit_gui_progress_update(14.0 + f * 2.0, "Processing elevation..."),
         );
     }
@@ -344,6 +358,12 @@ pub fn fetch_elevation_data(
         ground_level: effective_ground_level,
         soft_top,
     })
+}
+
+/// A non-negative length in metres from the environment, if set and well formed.
+fn metres_override(var: &str) -> Option<f64> {
+    let value = std::env::var(var).ok()?.trim().parse::<f64>().ok()?;
+    (value.is_finite() && value >= 0.0).then_some(value)
 }
 
 /// Clean up old cached elevation tiles in the background, at most once per day.

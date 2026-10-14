@@ -29,6 +29,7 @@ mod grid_ops;
 mod ground;
 mod ground_decoration;
 mod ground_generation;
+mod ign;
 mod land_cover;
 mod landmarks;
 mod luanti_block_map;
@@ -494,7 +495,20 @@ fn run_cli() {
         println!("{} Fetching Overture Maps data...", "  [+]".bold());
     }
     let fetch_start = std::time::Instant::now();
-    let (raw_data, overture_data, mut ground) = std::thread::scope(|s| {
+    let (raw_data, overture_data, ign_data, mut ground) = std::thread::scope(|s| {
+        let ign_handle = s.spawn(|| {
+            let t = std::time::Instant::now();
+            let data = if args.ign && !skip_objects {
+                ign::fetch_ign_data(
+                    &effective_bbox,
+                    &projection::ProjectionSpec::from_args(&args),
+                    args.debug,
+                )
+            } else {
+                ign::IgnData::default()
+            };
+            (data, t.elapsed())
+        });
         let overture_handle = s.spawn(|| {
             let t = std::time::Instant::now();
             let data = if args.overture && !skip_objects {
@@ -549,13 +563,21 @@ fn run_cli() {
             (overture::OvertureData::default(), std::time::Duration::ZERO)
         });
         bench.report("overture_fetch", overture_dur);
+        let (ign_data, ign_dur) = ign_handle.join().unwrap_or_else(|_| {
+            eprintln!(
+                "{} IGN fetch failed, continuing without IGN data.",
+                "Warning:".yellow().bold()
+            );
+            (ign::IgnData::default(), std::time::Duration::ZERO)
+        });
+        bench.report("ign_fetch", ign_dur);
         let (ground, ground_dur) = ground_handle.join().unwrap_or_else(|_| {
             eprintln!("{} Terrain fetch failed.", "Error:".red().bold());
             exit_failed();
         });
         bench.report("terrain_total", ground_dur);
 
-        (raw_data, overture_data, ground)
+        (raw_data, overture_data, ign_data, ground)
     });
     bench.report("fetch_total", fetch_start.elapsed());
     bench.reset();
@@ -575,6 +597,16 @@ fn run_cli() {
         elements: overture_elements,
         hints: overture_hints,
     } = overture_data;
+
+    // Measured heights first: what the IGN fills, Overture's conflated and
+    // partly ML-derived values no longer need to.
+    let ign_enriched = ign_data.buildings.apply(&mut parsed_elements);
+    if ign_enriched > 0 {
+        println!(
+            "  Filled heights on {} OSM buildings from IGN BD TOPO",
+            ign_enriched.to_string().bright_white().bold()
+        );
+    }
 
     // Fill height/levels on OSM buildings that have neither, before the
     // footprints are merged (Overture's own ways carry their tags already).

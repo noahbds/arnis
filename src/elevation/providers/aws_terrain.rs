@@ -163,6 +163,7 @@ impl ElevationProvider for AwsTerrain {
 
         Ok(RawElevationGrid {
             heights_meters: height_grid,
+            survey: None,
         })
     }
 }

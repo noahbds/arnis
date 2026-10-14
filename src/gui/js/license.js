@@ -47,6 +47,10 @@ export const licenseText = `
 <p>The "Additional Buildings" setting adds building footprints from the <a href="https://overturemaps.org/" target="_blank" rel="noopener noreferrer">Overture Maps Foundation</a> buildings theme, and fills in building heights that OpenStreetMap leaves untagged. Contains information from Overture Maps, which is made available under the <a href="https://opendatacommons.org/licenses/odbl/" target="_blank" rel="noopener noreferrer">Open Database License (ODbL)</a>. &copy; OpenStreetMap contributors; contributing sources include Esri Community Maps, Google Open Buildings, Microsoft Global ML Building Footprints and USGS 3DEP. Full attribution: <a href="https://docs.overturemaps.org/attribution/" target="_blank" rel="noopener noreferrer">docs.overturemaps.org/attribution</a>.</p>
 </div>
 <div class="credit">
+<h4>IGN BD TOPO</h4>
+<p>In France, building heights that OpenStreetMap leaves untagged are filled in from the BD TOPO&reg; of the <a href="https://www.ign.fr/" target="_blank" rel="noopener noreferrer">Institut national de l'information g&eacute;ographique et foresti&egrave;re</a>, served by the <a href="https://cartes.gouv.fr/" target="_blank" rel="noopener noreferrer">G&eacute;oplateforme</a>. Source: IGN, BD TOPO&reg;, current edition, made available under the <a href="https://www.etalab.gouv.fr/licence-ouverte-open-licence/" target="_blank" rel="noopener noreferrer">Licence Ouverte 2.0</a>.</p>
+</div>
+<div class="credit">
 <h4>Mapterhorn Terrain Tiles</h4>
 <p>Elevation data &copy; <a href="https://mapterhorn.com/" target="_blank" rel="noopener noreferrer">Mapterhorn</a>, aggregating open elevation datasets including Copernicus GLO-30 (&copy; DLR/ESA) and national terrain models from mapping agencies (GeoBasis-DE, IGN France, IGN Espa&ntilde;a, GSI Japan, swisstopo and others) under CC-BY-4.0-family licenses. Full source list: <a href="https://mapterhorn.com/attribution/" target="_blank" rel="noopener noreferrer">mapterhorn.com/attribution</a>.</p>
 </div>
