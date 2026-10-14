@@ -109,6 +109,8 @@ pub fn build_preview_payload(bbox_text: &str, aws_only: bool) -> Result<Vec<u8>,
         false,
         compute_grid_dims(&bbox, preview_scale),
         crate::elevation::AffinePolicy::Fit,
+        // No land cover here, so nothing for the tide to reclassify.
+        None,
     )
     .map_err(|e| format!("Elevation fetch failed: {e}"))?;
 

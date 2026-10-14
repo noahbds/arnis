@@ -1,4 +1,4 @@
-use crate::land_cover::{LandCoverData, LC_BUILT_UP, LC_WATER};
+use crate::land_cover::{LandCoverData, LC_BEACH, LC_BUILT_UP, LC_WATER};
 use fnv::{FnvHashMap, FnvHashSet};
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -199,6 +199,9 @@ pub fn repair_terrain_anomalies(heights: &mut [Vec<f64>], m_per_cell: f64) {
 ///
 /// `measured` marks cells taken from a survey known to be bare earth already;
 /// the built-up smoothing and the coastal pull leave those cells as they are.
+/// With a survey and a `sea_level_m`, the sea is placed by altitude first
+/// (see [`apply_sea_level`]).
+#[allow(clippy::too_many_arguments)]
 pub fn apply_land_cover_repair(
     heights: &mut [Vec<f64>],
     land_cover: &mut LandCoverData,
@@ -206,6 +209,7 @@ pub fn apply_land_cover_repair(
     coastal_pull_distance_cells: u32,
     m_per_cell: f64,
     measured: Option<&[Vec<bool>]>,
+    sea_level_m: Option<f64>,
     report: &dyn Fn(f64),
 ) {
     let grid_h = heights.len();
@@ -224,6 +228,22 @@ pub fn apply_land_cover_repair(
         );
         return;
     }
+
+    // Where the ground is surveyed, the tide line follows the altitude, not the
+    // satellite image; done first so every later pass sees the corrected sea.
+    let tide_changed = match (measured, sea_level_m) {
+        (Some(survey), Some(level)) => {
+            let (sea, foreshore) =
+                apply_sea_level(heights, &mut land_cover.grid, survey, level, m_per_cell);
+            if sea + foreshore > 0 {
+                eprintln!(
+                    "Land cover repair: sea placed at {level:.1} m from the survey: {sea} sea cells, {foreshore} cells of foreshore uncovered"
+                );
+            }
+            sea + foreshore > 0
+        }
+        _ => false,
+    };
 
     // Shadow blobs on slopes are not water; drop them before anything levels around them.
     let dropped = drop_water_on_steep_terrain(heights, &mut land_cover.grid, m_per_cell);
@@ -246,7 +266,7 @@ pub fn apply_land_cover_repair(
     // `grid_is_water = water_distance > 0` in ground.rs doesn't still treat
     // these cells as water.
     let reclassified = reclassify_non_surface_water_cells(&mut land_cover.grid, &is_water_surface);
-    if reclassified + dropped > 0 {
+    if reclassified + dropped > 0 || tide_changed {
         land_cover.water_distance =
             crate::land_cover::compute_water_distance(&land_cover.grid, grid_w, grid_h);
         // The water-blend smoothing was derived from the pre-reclassify
@@ -273,6 +293,190 @@ pub fn apply_land_cover_repair(
             coastal_pull_distance_cells,
         );
     }
+}
+
+/// Places the sea and the tidal channels by altitude on surveyed ground.
+///
+/// The land cover's water class comes from one satellite pass at whatever the
+/// tide was, so on a flat estuary it drowns sand banks and salt marsh metres
+/// above the water, or leaves dry what the chosen tide would cover. A metre
+/// survey says where the water really stands:
+///
+/// * the sea is everything at or below `level_m` reachable from open water at
+///   the edge of the area without climbing above it. A polder behind a dyke is
+///   lower than the sea but not reachable, so it stays dry. Sea cells are
+///   flattened to the level, so the leveling pass treats them as one body;
+/// * in low-lying water that runs off the edge of the area (the sea, an
+///   estuary, a river mouth), water is kept only where it is close to the
+///   lowest ground around it: channels stay wet, the banks above them become
+///   beach. Up an estuary the channel bed sits above the sea level, so the
+///   altitude alone cannot tell a channel from a sand bank; its neighbourhood can;
+/// * every other water body (an inland lake, a pond, a river far above the
+///   sea) is left as it was.
+///
+/// Cells off the survey keep the land cover's say: open sea beyond the survey
+/// still counts as sea. Returns the number of sea cells and of foreshore cells.
+fn apply_sea_level(
+    heights: &mut [Vec<f64>],
+    lc_grid: &mut [Vec<u8>],
+    survey: &[Vec<bool>],
+    level_m: f64,
+    m_per_cell: f64,
+) -> (usize, usize) {
+    // Water standing this far above the sea is a river or lake, not tidal.
+    const TIDAL_RANGE_M: f64 = 5.0;
+    // Neighbourhood that decides what counts as the channel, and how far above
+    // its floor water may still stand (wavelets, survey noise, a sloping bed).
+    const CHANNEL_RADIUS_M: f64 = 150.0;
+    const CHANNEL_DEPTH_M: f64 = 0.5;
+
+    let h = heights.len();
+    let w = heights.first().map_or(0, Vec::len);
+    if h < 2 || w < 2 || lc_grid.len() != h || survey.len() != h {
+        return (0, 0);
+    }
+    let surveyed = |x: usize, y: usize| survey[y].get(x).copied().unwrap_or(false);
+    let neighbours = |x: usize, y: usize| {
+        [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)]
+            .into_iter()
+            .filter_map(move |(dx, dy)| {
+                let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                (nx >= 0 && ny >= 0 && nx < w as i32 && ny < h as i32)
+                    .then_some((nx as usize, ny as usize))
+            })
+    };
+    let on_edge = |x: usize, y: usize| x == 0 || y == 0 || x == w - 1 || y == h - 1;
+
+    // 1. The sea: ground at or below the level, reached from open water at the edge.
+    let floodable = |x: usize, y: usize, heights: &[Vec<f64>], lc: &[Vec<u8>]| {
+        if surveyed(x, y) {
+            heights[y][x].is_finite() && heights[y][x] <= level_m
+        } else {
+            lc[y][x] == LC_WATER
+        }
+    };
+    let mut sea = vec![vec![false; w]; h];
+    let mut queue: VecDeque<(usize, usize)> = VecDeque::new();
+    for y in 0..h {
+        for x in 0..w {
+            if on_edge(x, y) && lc_grid[y][x] == LC_WATER && floodable(x, y, heights, lc_grid) {
+                sea[y][x] = true;
+                queue.push_back((x, y));
+            }
+        }
+    }
+    while let Some((x, y)) = queue.pop_front() {
+        for (nx, ny) in neighbours(x, y) {
+            if !sea[ny][nx] && floodable(nx, ny, heights, lc_grid) {
+                sea[ny][nx] = true;
+                queue.push_back((nx, ny));
+            }
+        }
+    }
+    let mut sea_cells = 0usize;
+    for y in 0..h {
+        for x in 0..w {
+            if sea[y][x] {
+                lc_grid[y][x] = LC_WATER;
+                heights[y][x] = level_m;
+                sea_cells += 1;
+            }
+        }
+    }
+
+    // 2. Low-lying water running off the edge: keep the channels, uncover the banks.
+    let mut tidal = vec![vec![false; w]; h];
+    let mut seen = vec![vec![false; w]; h];
+    let mut body: Vec<(usize, usize)> = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            if seen[y][x] || lc_grid[y][x] != LC_WATER {
+                continue;
+            }
+            body.clear();
+            seen[y][x] = true;
+            queue.push_back((x, y));
+            let (mut touches_edge, mut lowest) = (false, f64::INFINITY);
+            while let Some((cx, cy)) = queue.pop_front() {
+                body.push((cx, cy));
+                touches_edge |= on_edge(cx, cy);
+                if surveyed(cx, cy) && heights[cy][cx].is_finite() {
+                    lowest = lowest.min(heights[cy][cx]);
+                }
+                for (nx, ny) in neighbours(cx, cy) {
+                    if !seen[ny][nx] && lc_grid[ny][nx] == LC_WATER {
+                        seen[ny][nx] = true;
+                        queue.push_back((nx, ny));
+                    }
+                }
+            }
+            if touches_edge && lowest <= level_m + TIDAL_RANGE_M {
+                for &(bx, by) in &body {
+                    tidal[by][bx] = true;
+                }
+            }
+        }
+    }
+
+    // Lowest water within the channel radius of each cell, over tidal water only.
+    let radius = (CHANNEL_RADIUS_M / m_per_cell.max(1e-6)).round().max(1.0) as usize;
+    let floor_of = |x: usize, y: usize| {
+        if tidal[y][x] && heights[y][x].is_finite() {
+            heights[y][x]
+        } else {
+            f64::INFINITY
+        }
+    };
+    let mut rows_min = vec![vec![f64::INFINITY; w]; h];
+    for (y, out) in rows_min.iter_mut().enumerate() {
+        let line: Vec<f64> = (0..w).map(|x| floor_of(x, y)).collect();
+        *out = sliding_min(&line, radius);
+    }
+    let mut channel_floor = vec![vec![f64::INFINITY; w]; h];
+    for x in 0..w {
+        let column: Vec<f64> = (0..h).map(|y| rows_min[y][x]).collect();
+        for (y, v) in sliding_min(&column, radius).into_iter().enumerate() {
+            channel_floor[y][x] = v;
+        }
+    }
+
+    let mut foreshore = 0usize;
+    for y in 0..h {
+        for x in 0..w {
+            if !tidal[y][x] || sea[y][x] || !surveyed(x, y) || !heights[y][x].is_finite() {
+                continue;
+            }
+            if heights[y][x] > channel_floor[y][x] + CHANNEL_DEPTH_M {
+                lc_grid[y][x] = LC_BEACH;
+                foreshore += 1;
+            }
+        }
+    }
+    (sea_cells, foreshore)
+}
+
+/// Minimum over a window of `radius` cells either side, in linear time.
+fn sliding_min(values: &[f64], radius: usize) -> Vec<f64> {
+    let n = values.len();
+    let mut out = vec![f64::INFINITY; n];
+    let mut window: VecDeque<usize> = VecDeque::new();
+    // The window for output i spans [i - radius, i + radius]; feed indices ahead.
+    let mut next = 0usize;
+    for (i, slot) in out.iter_mut().enumerate() {
+        let hi = (i + radius).min(n - 1);
+        while next <= hi {
+            while window.back().is_some_and(|&b| values[b] >= values[next]) {
+                window.pop_back();
+            }
+            window.push_back(next);
+            next += 1;
+        }
+        while window.front().is_some_and(|&f| f + radius < i) {
+            window.pop_front();
+        }
+        *slot = window.front().map_or(f64::INFINITY, |&f| values[f]);
+    }
+    out
 }
 
 fn is_measured(measured: Option<&[Vec<bool>]>, x: usize, y: usize) -> bool {
@@ -4132,5 +4336,125 @@ mod survey_tests {
         let surveyed = vec![vec![true; w]; 3];
         pull_coastal_land_toward_water(&mut heights, &water, Some(&surveyed), 5);
         assert_eq!(heights[1][1], 5.0);
+    }
+}
+
+#[cfg(test)]
+mod sea_level_tests {
+    use super::*;
+    use crate::land_cover::LC_GRASSLAND;
+
+    /// Rows of heights in metres and the land cover the satellite gave them
+    /// (`w` water, `.` grassland); every cell surveyed.
+    fn area(rows: &[(&[f64], &str)]) -> (Vec<Vec<f64>>, Vec<Vec<u8>>, Vec<Vec<bool>>) {
+        let heights = rows.iter().map(|(h, _)| h.to_vec()).collect::<Vec<_>>();
+        let lc = rows
+            .iter()
+            .map(|(_, c)| {
+                c.chars()
+                    .map(|ch| if ch == 'w' { LC_WATER } else { LC_GRASSLAND })
+                    .collect()
+            })
+            .collect::<Vec<_>>();
+        let survey = vec![vec![true; heights[0].len()]; heights.len()];
+        (heights, lc, survey)
+    }
+
+    #[test]
+    fn foreshore_above_the_sea_is_uncovered_and_the_sea_is_flat() {
+        // Open sea on the left, a sand bank the satellite saw wet, then land.
+        let row: &[f64] = &[-2.0, -1.0, 1.5, 2.5, 6.0];
+        let (mut heights, mut lc, survey) = area(&[(row, "wwww."), (row, "wwww."), (row, "wwww.")]);
+
+        let (sea, foreshore) = apply_sea_level(&mut heights, &mut lc, &survey, 0.0, 1.0);
+
+        assert_eq!((sea, foreshore), (6, 6));
+        for y in 0..3 {
+            assert_eq!(lc[y][0..2], [LC_WATER, LC_WATER]);
+            assert_eq!(heights[y][0..2], [0.0, 0.0]);
+            assert_eq!(lc[y][2..4], [LC_BEACH, LC_BEACH]);
+            assert_eq!(heights[y][2], 1.5, "uncovered ground keeps its altitude");
+            assert_eq!(lc[y][4], LC_GRASSLAND);
+        }
+    }
+
+    #[test]
+    fn a_polder_behind_a_dyke_stays_dry() {
+        // Sea, a dyke at 8 m, then a polder at -1 m.
+        let row: &[f64] = &[-2.0, -2.0, 8.0, -1.0, -1.0];
+        let (mut heights, mut lc, survey) = area(&[(row, "ww..."), (row, "ww..."), (row, "ww...")]);
+
+        apply_sea_level(&mut heights, &mut lc, &survey, 0.0, 1.0);
+
+        for y in 0..3 {
+            assert_eq!(lc[y][3..5], [LC_GRASSLAND, LC_GRASSLAND]);
+            assert_eq!(heights[y][3], -1.0);
+        }
+    }
+
+    #[test]
+    fn a_lake_that_never_touches_the_sea_is_left_alone() {
+        // A lake at 3 m in the middle of land, no open water at the edge.
+        let land: &[f64] = &[5.0, 5.0, 5.0, 5.0, 5.0];
+        let lake: &[f64] = &[5.0, 3.0, 3.0, 3.0, 5.0];
+        let (mut heights, mut lc, survey) =
+            area(&[(land, "....."), (lake, ".www."), (land, ".....")]);
+
+        let changed = apply_sea_level(&mut heights, &mut lc, &survey, 0.0, 1.0);
+
+        assert_eq!(changed, (0, 0));
+        assert_eq!(lc[1][1..4], [LC_WATER, LC_WATER, LC_WATER]);
+    }
+
+    #[test]
+    fn up_the_estuary_the_channel_stays_wet_and_the_banks_dry() {
+        // No ground at or below the sea level: a channel bed at +1 m between sand
+        // banks at +2.5 m, all seen as water, running off both edges.
+        let row: &[f64] = &[2.5, 2.5, 1.0, 1.1, 2.5, 2.5, 7.0];
+        let (mut heights, mut lc, survey) =
+            area(&[(row, "wwwwww."), (row, "wwwwww."), (row, "wwwwww.")]);
+
+        let (sea, foreshore) = apply_sea_level(&mut heights, &mut lc, &survey, 0.0, 1.0);
+
+        assert_eq!(sea, 0);
+        assert_eq!(foreshore, 12);
+        for y in 0..3 {
+            assert_eq!(lc[y][2..4], [LC_WATER, LC_WATER]);
+            assert_eq!(lc[y][0..2], [LC_BEACH, LC_BEACH]);
+            assert_eq!(lc[y][4..6], [LC_BEACH, LC_BEACH]);
+        }
+    }
+
+    #[test]
+    fn a_river_far_above_the_sea_is_left_alone() {
+        // A river at 30 m crossing the area, with a sand bar a metre above it.
+        let row: &[f64] = &[40.0, 30.0, 31.0, 30.0, 40.0];
+        let (mut heights, mut lc, survey) = area(&[(row, ".www."), (row, ".www.")]);
+
+        assert_eq!(
+            apply_sea_level(&mut heights, &mut lc, &survey, 0.0, 1.0),
+            (0, 0)
+        );
+        assert_eq!(lc[0][2], LC_WATER);
+    }
+
+    #[test]
+    fn sliding_min_covers_the_window_on_both_sides() {
+        let v = [5.0, 3.0, 9.0, 9.0, 9.0, 1.0, 9.0];
+        assert_eq!(sliding_min(&v, 1), vec![3.0, 3.0, 3.0, 9.0, 1.0, 1.0, 1.0]);
+        assert_eq!(sliding_min(&v, 0), v.to_vec());
+        assert_eq!(sliding_min(&v, 10), vec![1.0; 7]);
+    }
+
+    #[test]
+    fn low_ground_open_to_the_sea_is_flooded_at_a_high_level() {
+        // At a 4 m sea, the beach at 2 m that the satellite saw dry goes under.
+        let row: &[f64] = &[-1.0, 2.0, 3.0, 6.0];
+        let (mut heights, mut lc, survey) = area(&[(row, "w..."), (row, "w...")]);
+
+        apply_sea_level(&mut heights, &mut lc, &survey, 4.0, 1.0);
+
+        assert_eq!(lc[0], vec![LC_WATER, LC_WATER, LC_WATER, LC_GRASSLAND]);
+        assert_eq!(heights[0][1], 4.0);
     }
 }

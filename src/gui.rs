@@ -1725,6 +1725,7 @@ fn gui_start_generation(
                 overture: overture_enabled,
                 // No setting yet: it only acts inside France, and only adds heights.
                 ign: true,
+                sea_level: 0.0,
                 // Auto picks whichever transport is cheaper for the area. The
                 // two are not bit-identical - tiles quantise coordinates to a
                 // 0.4 m lattice and keep the largest ring of a multipolygon the

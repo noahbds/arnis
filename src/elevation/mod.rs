@@ -202,6 +202,7 @@ pub fn fetch_elevation_data(
     benchmark: bool,
     dims: (usize, usize, usize, usize),
     affine: AffinePolicy,
+    sea_level_m: Option<f64>,
 ) -> Result<ElevationData, Box<dyn std::error::Error>> {
     let mut bench = crate::bench::Bench::new(benchmark);
     let (world_width, world_height, grid_width, grid_height) = dims;
@@ -293,6 +294,8 @@ pub fn fetch_elevation_data(
             coastal_pull_cells,
             m_per_cell,
             survey.as_deref(),
+            // Only meaningful on surveyed ground, which `survey` already limits to France.
+            sea_level_m.filter(|_| survey.is_some()),
             &|f| emit_gui_progress_update(14.0 + f * 2.0, "Processing elevation..."),
         );
     }

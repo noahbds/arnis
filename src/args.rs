@@ -166,6 +166,13 @@ pub struct Args {
     #[arg(long = "ign", default_value_t = true, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub ign: bool,
 
+    /// Height of the sea, in metres above the national datum, where the terrain
+    /// comes from a metre survey (France). The sea fills what lies below it and
+    /// is open to the sea; the foreshore above it is left dry. 0 is close to
+    /// mean sea level; lower values uncover more foreshore, as at low tide.
+    #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+    pub sea_level: f64,
+
     /// Disable both external 3D models (3DMR + Wikimedia) and bundled schematic
     /// props (cars, boats, cranes, ...) with a single toggle.
     #[arg(long = "no-3d", default_value_t = true, action = ArgAction::SetFalse)]
