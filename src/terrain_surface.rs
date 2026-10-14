@@ -6,9 +6,9 @@
 //! speckle, and tiles stitch without seams.
 
 use crate::block_definitions::{
-    Block, ANDESITE, BLUE_ICE, COARSE_DIRT, COBBLED_DEEPSLATE, COBBLESTONE, DEEPSLATE, DIRT,
-    GRASS_BLOCK, GRAVEL, ICE, MOSS_BLOCK, PACKED_ICE, PODZOL, SNOWY_GRASS_BLOCK, SNOWY_PODZOL,
-    SNOW_BLOCK, SNOW_LAYERS, STONE, TUFF,
+    Block, ANDESITE, BLUE_ICE, CALCITE, CLAY, COARSE_DIRT, COBBLED_DEEPSLATE, COBBLESTONE,
+    DEEPSLATE, DIORITE, DIRT, GRANITE, GRASS_BLOCK, GRAVEL, ICE, MOSS_BLOCK, MUD, PACKED_ICE,
+    PODZOL, SAND, SANDSTONE, SNOWY_GRASS_BLOCK, SNOWY_PODZOL, SNOW_BLOCK, SNOW_LAYERS, STONE, TUFF,
 };
 use crate::climate::Climate;
 use crate::coordinate_system::cartesian::XZPoint;
@@ -28,6 +28,10 @@ const SALT_SCREE: u32 = 0x5C4E_E0B2;
 const SALT_SCREE_EDGE: u32 = 0x5C4E_ED6E;
 const SALT_WORN: u32 = 0x0B0A_4E11;
 const SALT_BARE_ROCK: u32 = 0xBA4E_40C3;
+const SALT_FORESHORE: u32 = 0xF04E_5404;
+const SALT_FORESHORE_CLAY: u32 = 0xF04E_C1A7;
+const SALT_SHINGLE: u32 = 0x5414_61E5;
+const SALT_ROCK_PLATFORM: u32 = 0x4F0C_9A7F;
 const SALT_SNOW_LINE: u32 = 0x5A0E_11A4;
 const SALT_SNOW_DRIFT: u32 = 0xD41F_7B05;
 const SALT_SNOW_FIELD: u32 = 0xF1E1_D5A0;
@@ -426,6 +430,70 @@ pub(crate) fn bare_rock_palette(x: i32, z: i32) -> (Block, Block) {
     } else {
         (STONE, STONE)
     }
+}
+
+/// Sandy foreshore: sand, with damp traces of silt in the hollows. Where the
+/// terrain is known, the real mud is placed by altitude instead (see
+/// [`mudflat_palette`]); this is also the look of a sandy tidal flat without it.
+pub(crate) fn foreshore_palette(x: i32, z: i32) -> (Block, Block) {
+    let wet = patch_noise(x, z, 5, SALT_FORESHORE);
+    if wet < 0.04 {
+        (MUD, SAND)
+    } else if wet < 0.09 && patch_noise(x, z, 3, SALT_FORESHORE_CLAY) < 0.5 {
+        (CLAY, SAND)
+    } else {
+        (SAND, SANDSTONE)
+    }
+}
+
+/// A muddy tidal flat: mud, with clay where it firms up.
+pub(crate) fn mudflat_palette(x: i32, z: i32) -> (Block, Block) {
+    if patch_noise(x, z, 6, SALT_FORESHORE) < 0.15 {
+        (CLAY, MUD)
+    } else {
+        (MUD, MUD)
+    }
+}
+
+/// A shingle beach: grey gravel with darker and paler pebbles worked in, in
+/// drifts a few blocks across rather than a flat grey sheet.
+pub(crate) fn shingle_block(x: i32, z: i32) -> Block {
+    let drift = patch_noise(x, z, 4, SALT_SHINGLE);
+    let pebble = crate::land_cover::coord_hash(x, z) % 100;
+    match (drift < 0.3, pebble) {
+        (_, 0..=7) => TUFF,
+        (_, 8..=13) => DIORITE,
+        (true, 14..=39) => ANDESITE,
+        (true, 40..=49) => COBBLESTONE,
+        _ => GRAVEL,
+    }
+}
+
+/// Bare rock of a known kind (`rock=*`), as found on wave-cut platforms; `None`
+/// leaves the generic rock mix.
+pub(crate) fn rock_block(rock: &str, x: i32, z: i32) -> Option<Block> {
+    let patch = patch_noise(x, z, 5, SALT_ROCK_PLATFORM);
+    let grain = crate::land_cover::coord_hash(x, z) % 100;
+    Some(match rock {
+        // White chalk with flint gravel, green with algae where the tide keeps it wet.
+        "chalk" => match (patch, grain) {
+            (p, _) if p < 0.14 => MOSS_BLOCK,
+            (_, 0..=9) => GRAVEL,
+            (_, 10..=24) => DIORITE,
+            _ => CALCITE,
+        },
+        "limestone" => match grain {
+            0..=29 => DIORITE,
+            30..=44 => STONE,
+            _ => CALCITE,
+        },
+        "granite" => match grain {
+            0..=34 => STONE,
+            35..=49 => ANDESITE,
+            _ => GRANITE,
+        },
+        _ => return None,
+    })
 }
 
 /// How snow settles on one column.
@@ -976,5 +1044,42 @@ mod tests {
             snow_cover(line.depth(0, 0, 5000), 0.0, || 2.0, 1.0, 0, 0),
             Snow::None
         );
+    }
+}
+
+#[cfg(test)]
+mod coast_palette_tests {
+    use super::*;
+
+    /// Share of `f`'s blocks that are `block` over a 600 x 600 area, in percent:
+    /// patches tens of blocks across only average out over that much ground.
+    fn share(f: impl Fn(i32, i32) -> Block, block: Block) -> f64 {
+        let hits = (0..600)
+            .flat_map(|x| (0..600).map(move |z| (x, z)))
+            .filter(|&(x, z)| f(x, z) == block)
+            .count();
+        100.0 * hits as f64 / 360_000.0
+    }
+
+    #[test]
+    fn the_sandy_foreshore_has_only_traces_of_silt() {
+        let surface = |x, z| foreshore_palette(x, z).0;
+        assert!((2.0..7.0).contains(&share(surface, MUD)));
+        assert!((1.0..6.0).contains(&share(surface, CLAY)));
+        assert!(share(surface, SAND) > 85.0);
+    }
+
+    #[test]
+    fn shingle_is_mostly_gravel() {
+        assert!(share(shingle_block, GRAVEL) > 50.0);
+        assert!(share(shingle_block, TUFF) > 5.0);
+    }
+
+    #[test]
+    fn chalk_is_mostly_calcite_with_algae() {
+        let chalk = |x, z| rock_block("chalk", x, z).unwrap();
+        assert!((55.0..75.0).contains(&share(chalk, CALCITE)));
+        assert!((8.0..20.0).contains(&share(chalk, MOSS_BLOCK)));
+        assert_eq!(rock_block("basalt", 0, 0), None);
     }
 }

@@ -432,7 +432,14 @@ fn near_beach(editor: &WorldEditor, x: i32, z: i32) -> bool {
     let r = ((12.0 * editor.scale()).round() as i32).clamp(2, 12);
     [(0, 0), (r, 0), (-r, 0), (0, r), (0, -r)]
         .iter()
-        .any(|&(dx, dz)| editor.cover_class(x + dx, z + dz) == crate::land_cover::LC_BEACH)
+        .any(|&(dx, dz)| {
+            matches!(
+                editor.cover_class(x + dx, z + dz),
+                crate::land_cover::LC_BEACH
+                    | crate::land_cover::LC_FORESHORE
+                    | crate::land_cover::LC_MUDFLAT
+            )
+        })
 }
 
 /// Map a chosen `TreeType` to a habitat hint that steers region community selection.

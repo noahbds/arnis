@@ -279,7 +279,10 @@ pub fn fetch_osm_data(
     if use_tile_archive && !tiles_url.is_empty() {
         // A miss is a coverage gap or a network problem, and Overpass still has the data.
         match crate::osm_tiles::fetch_data_from_tiles(bbox, tiles_url) {
-            Ok(data) => return Ok(data),
+            Ok(mut data) => {
+                add_missing_natural_areas(bbox, &mut data);
+                return Ok(data);
+            }
             Err(e) => {
                 eprintln!(
                     "{}",
@@ -296,6 +299,62 @@ pub fn fetch_osm_data(
         }
     }
     fetch_data_from_overpass(bbox, debug, download_method, save_file)
+}
+
+/// Natural-area multipolygons fetched from Overpass on top of the tile archive.
+const MISSING_AREAS_QUERY_TIMEOUT_SECS: u64 = 120;
+
+/// Adds the natural-area multipolygons the tile archive leaves out.
+///
+/// The archive drops multipolygon relations that reach far beyond the area: on
+/// the Baie de Somme the tidal flat covering the bay (22,000 ha) and its salt
+/// marsh never arrive, though Overpass serves them whole and the parser draws
+/// them. One small query fetches just those relations with their member ways,
+/// and whatever the archive already holds is kept as it is.
+///
+/// Limited to the French territories, where it has been checked; anywhere else
+/// it would add a request per run to the shared Overpass server for areas no
+/// one has looked at. A failure only costs these areas.
+fn add_missing_natural_areas(bbox: LLBBox, data: &mut OsmData) {
+    if !crate::ign::may_be_covered(&bbox) {
+        return;
+    }
+    let query = format!(
+        r#"[out:json][timeout:{}][bbox:{},{},{},{}];
+    relation["type"="multipolygon"]["natural"~"^(wetland|beach|sand|shoal|mud|scrub|heath|grassland|bare_rock)$"]->.areas;
+    way(r.areas)->.members;
+    node(w.members)->.points;
+    .areas out body;
+    .members out body;
+    .points out skel qt;"#,
+        MISSING_AREAS_QUERY_TIMEOUT_SECS,
+        bbox.min().lat(),
+        bbox.min().lng(),
+        bbox.max().lat(),
+        bbox.max().lng(),
+    );
+    let fetched =
+        download_with_reqwest(ARNIS_OVERPASS_URL, &query, MISSING_AREAS_QUERY_TIMEOUT_SECS)
+            .map_err(|e| e.to_string())
+            .and_then(|body| parse_overpass_response(&body).map_err(|e| e.message().to_string()));
+    match fetched {
+        Ok(extra) => {
+            let added = data.add_missing_relations(extra);
+            if added > 0 {
+                println!(
+                    "  Added {} natural areas the tile archive left out",
+                    added.to_string().bright_white().bold()
+                );
+            }
+        }
+        Err(e) => eprintln!(
+            "{}",
+            format!(
+                "Warning: could not fetch the large natural areas ({e}); continuing without them."
+            )
+            .yellow()
+        ),
+    }
 }
 
 /// Main function to fetch data

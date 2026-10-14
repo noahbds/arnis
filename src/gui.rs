@@ -2014,6 +2014,7 @@ fn gui_start_generation(
 
                     // Measured IGN heights first, then Overture for what is left
                     ign_data.buildings.apply(&mut parsed_elements);
+                    parsed_elements.extend(ign_data.elements);
 
                     // Fill height/levels on OSM buildings that have neither
                     overture_hints.apply(&mut parsed_elements);

@@ -729,6 +729,8 @@ pub fn generate_ground_region(
                                                         cc == land_cover::LC_BARE
                                                             || cc == land_cover::LC_SNOW_ICE
                                                             || cc == land_cover::LC_BEACH
+                                                            || cc == land_cover::LC_FORESHORE
+                                                            || cc == land_cover::LC_MUDFLAT
                                                     })
                                                     .count();
                                             if neighbors_bare == 0 {
@@ -757,6 +759,12 @@ pub fn generate_ground_region(
                                             } else {
                                                 (SAND, SANDSTONE)
                                             }
+                                        }
+                                        land_cover::LC_FORESHORE => {
+                                            crate::terrain_surface::foreshore_palette(x, z)
+                                        }
+                                        land_cover::LC_MUDFLAT => {
+                                            crate::terrain_surface::mudflat_palette(x, z)
                                         }
                                         // LC_WATER handled above with variable depth
                                         land_cover::LC_WETLAND => (MUD, DIRT),

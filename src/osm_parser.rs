@@ -122,6 +122,27 @@ impl OsmData {
         &self.elements
     }
 
+    /// Adds the relations of `other` that this dataset lacks, with the ways and
+    /// nodes they need that are not here yet. Returns the number of relations added.
+    pub fn add_missing_relations(&mut self, other: OsmData) -> usize {
+        let present: HashSet<(String, u64)> = self
+            .elements
+            .iter()
+            .map(|e| (e.r#type.clone(), e.id))
+            .collect();
+        let mut added = 0;
+        for element in other.elements {
+            if present.contains(&(element.r#type.clone(), element.id)) {
+                continue;
+            }
+            if element.r#type == "relation" {
+                added += 1;
+            }
+            self.elements.push(element);
+        }
+        added
+    }
+
     /// Object-free dataset, used by terrain-only runs that never query Overpass.
     pub fn empty() -> Self {
         OsmData {
@@ -2697,5 +2718,52 @@ mod arch_era_tests {
         );
         assert_eq!(arch_era_from_hint(StyleHint::Glass), ArchEra::Contemporary);
         assert_eq!(arch_era_from_hint(StyleHint::None), ArchEra::Unknown);
+    }
+}
+
+#[cfg(test)]
+mod add_missing_relations_tests {
+    use super::*;
+
+    fn element(kind: &str, id: u64) -> OsmElement {
+        OsmElement {
+            r#type: kind.to_string(),
+            id,
+            lat: (kind == "node").then_some(50.0),
+            lon: (kind == "node").then_some(1.6),
+            nodes: (kind == "way").then(Vec::new),
+            tags: None,
+            members: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn only_what_is_missing_is_added() {
+        let mut data = OsmData::from_elements(vec![element("way", 1), element("node", 10)]);
+        let extra = OsmData::from_elements(vec![
+            element("relation", 7),
+            element("way", 1),
+            element("way", 2),
+            element("node", 10),
+            element("node", 11),
+        ]);
+
+        assert_eq!(data.add_missing_relations(extra), 1);
+        let mut kinds: Vec<(String, u64)> = data
+            .elements()
+            .iter()
+            .map(|e| (e.r#type.clone(), e.id))
+            .collect();
+        kinds.sort();
+        assert_eq!(
+            kinds,
+            vec![
+                ("node".to_string(), 10),
+                ("node".to_string(), 11),
+                ("relation".to_string(), 7),
+                ("way".to_string(), 1),
+                ("way".to_string(), 2),
+            ]
+        );
     }
 }

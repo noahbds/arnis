@@ -430,7 +430,13 @@ fn military_ground(
     let cover = editor.cover_class(x, z);
     let h = coord_hash(x, z);
     match cover {
-        LC_WATER | LC_WETLAND | LC_MANGROVES | LC_SNOW_ICE | LC_BEACH => None,
+        LC_WATER
+        | LC_WETLAND
+        | LC_MANGROVES
+        | LC_SNOW_ICE
+        | LC_BEACH
+        | crate::land_cover::LC_FORESHORE
+        | crate::land_cover::LC_MUDFLAT => None,
         LC_BUILT_UP => {
             // Concrete yards with gravel hardstands for the vehicles and strips of lawn.
             let n = value_noise_01(x + 211, z + 17, 7);

@@ -77,6 +77,13 @@ pub const LC_MOSS: u8 = 100;
 /// Bare ground at the water's edge: a sand or shingle beach where bare ground elsewhere is
 /// rock and scree. Synthetic, never read from ESA; set by [`mark_beaches`].
 pub const LC_BEACH: u8 = 61;
+/// Arnis-internal: foreshore the tide leaves dry, placed by altitude where the terrain
+/// is surveyed (see `apply_sea_level`). A beach in every respect but its ground,
+/// which is sand and mud rather than clean sand.
+pub const LC_FORESHORE: u8 = 62;
+/// Arnis-internal: the low, sheltered part of that foreshore, close above the channels
+/// and away from the waves, where the flat stays wet and silt settles: mud.
+pub const LC_MUDFLAT: u8 = 63;
 
 /// How far from the water bare ground still counts as beach.
 const BEACH_REACH_M: f64 = 50.0;
@@ -1605,6 +1612,8 @@ mod smoothing_scale_tests {
                 .map(|&c| match c {
                     LC_WATER => 'w',
                     LC_BEACH => 's',
+                    LC_FORESHORE => 'f',
+                    LC_MUDFLAT => 'm',
                     LC_BARE => 'b',
                     _ => 'g',
                 })

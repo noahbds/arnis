@@ -1241,6 +1241,8 @@ impl Ground {
                     land_cover::LC_MANGROVES => Rgb([0x00, 0xcf, 0x75]),
                     land_cover::LC_MOSS => Rgb([0xfa, 0xe6, 0xa0]),
                     land_cover::LC_BEACH => Rgb([0xe8, 0xd8, 0x9c]),
+                    land_cover::LC_FORESHORE => Rgb([0xb8, 0xa8, 0x7c]),
+                    land_cover::LC_MUDFLAT => Rgb([0x6a, 0x5c, 0x4a]),
                     _ => Rgb([0x00, 0x00, 0x00]),
                 };
                 img.put_pixel(x as u32, y as u32, color);

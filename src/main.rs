@@ -600,7 +600,11 @@ fn run_cli() {
 
     // Measured heights first: what the IGN fills, Overture's conflated and
     // partly ML-derived values no longer need to.
-    let ign_enriched = ign_data.buildings.apply(&mut parsed_elements);
+    let ign::IgnData {
+        buildings: ign_buildings,
+        elements: ign_elements,
+    } = ign_data;
+    let ign_enriched = ign_buildings.apply(&mut parsed_elements);
     if ign_enriched > 0 {
         println!(
             "  Filled heights on {} OSM buildings from IGN BD TOPO",
@@ -617,6 +621,9 @@ fn run_cli() {
             enriched.to_string().bright_white().bold()
         );
     }
+
+    // Drawn on top of what OSM maps there: a foreshore OSM maps too ends up the same.
+    parsed_elements.extend(ign_elements);
 
     if !overture_elements.is_empty() {
         let before_count = parsed_elements.len();

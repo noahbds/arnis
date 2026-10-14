@@ -59,6 +59,10 @@ pub fn generate_natural(
                 "bare_rock" => STONE,
                 "blockfield" => COBBLESTONE,
                 "glacier" => PACKED_ICE,
+                // A tidal flat is mud unless mapped as sand or shingle, as most of a sandy bay is.
+                "wetland" if is_tidal_flat(element.tags()) => {
+                    tidal_flat_block(element.tags().get("surface"))
+                }
                 "mud" | "wetland" => MUD,
                 "mountain_range" => COBBLESTONE,
                 "saddle" | "ridge" => STONE,
@@ -205,7 +209,45 @@ pub fn generate_natural(
                     );
 
                 let mut shrubbery_species: Option<Block> = None;
+                let tidal_flat = natural_type == "wetland" && is_tidal_flat(element.tags());
+                let rock_kind = element.tags().get("rock").map(String::as_str);
+                // Per-cell ground where the area's material is a mix rather than one block.
+                // `cover` is the land cover under the cell: where the sea was placed by
+                // altitude it already says which part of a tidal flat is mud and which sand.
+                let ground_at = |x: i32, z: i32, cover: u8| -> Block {
+                    match natural_type.as_str() {
+                        "beach" | "shoal" if block_type == GRAVEL => {
+                            crate::terrain_surface::shingle_block(x, z)
+                        }
+                        "wetland" if tidal_flat && cover == crate::land_cover::LC_MUDFLAT => {
+                            crate::terrain_surface::mudflat_palette(x, z).0
+                        }
+                        "wetland" if tidal_flat && cover == crate::land_cover::LC_FORESHORE => {
+                            crate::terrain_surface::foreshore_palette(x, z).0
+                        }
+                        "wetland" if tidal_flat && block_type == SAND => {
+                            crate::terrain_surface::foreshore_palette(x, z).0
+                        }
+                        "wetland" if tidal_flat && block_type == MUD => {
+                            crate::terrain_surface::mudflat_palette(x, z).0
+                        }
+                        // A rock of known kind (chalk, granite...) takes its own mix,
+                        // any other a varied stone surface.
+                        "bare_rock" => rock_kind
+                            .and_then(|kind| crate::terrain_surface::rock_block(kind, x, z))
+                            .unwrap_or(match crate::land_cover::coord_hash(x, z) % 12 {
+                                0..=4 => STONE,       // ~42% stone
+                                5..=6 => ANDESITE,    // ~17% andesite
+                                7..=8 => COBBLESTONE, // ~17% cobblestone
+                                9 => GRAVEL,          // ~8% gravel
+                                10 => TUFF,           // ~8% tuff
+                                _ => COARSE_DIRT,     // ~8% coarse dirt
+                            }),
+                        _ => block_type,
+                    }
+                };
                 for &(x, z) in filled_area.iter() {
+                    let cover = editor.cover_class(x, z);
                     // Roads, paths and paved areas keep their own surface. Checked
                     // by mask because a gravel or dirt road is not in the block list.
                     let sealed = editor.surface_is_sealed(x, z);
@@ -213,7 +255,7 @@ pub fn generate_natural(
                         let b = if rock_variation {
                             vary_rock_block(block_type, x, z)
                         } else {
-                            block_type
+                            ground_at(x, z, cover)
                         };
                         editor.set_block(b, x, 0, z, None, None);
                     }
@@ -223,24 +265,11 @@ pub fn generate_natural(
                     // Generate custom layer instead of dirt, must be stone on the lowest level
                     match natural_type.as_str() {
                         "beach" | "sand" | "dune" | "shoal" => {
-                            editor.set_block(block_type, x, 0, z, None, None);
+                            editor.set_block(ground_at(x, z, cover), x, 0, z, None, None);
                         }
                         "glacier" => {
                             editor.set_block(PACKED_ICE, x, 0, z, None, None);
                             editor.set_block(STONE, x, -1, z, None, None);
-                        }
-                        "bare_rock" => {
-                            // Varied rock surface: stone base with natural variation
-                            let h = crate::land_cover::coord_hash(x, z) % 12;
-                            let rock = match h {
-                                0..=4 => STONE,       // ~42% stone
-                                5..=6 => ANDESITE,    // ~17% andesite
-                                7..=8 => COBBLESTONE, // ~17% cobblestone
-                                9 => GRAVEL,          // ~8% gravel
-                                10 => TUFF,           // ~8% tuff
-                                _ => COARSE_DIRT,     // ~8% coarse dirt
-                            };
-                            editor.set_block(rock, x, 0, z, None, None);
                         }
                         _ => {}
                     }
@@ -374,9 +403,13 @@ pub fn generate_natural(
                                 editor.set_block(GRASS, x, 1, z, None, None);
                                 continue;
                             }
-                            // Tidalflat stays bare mud with scattered water, no mosaic
+                            // Tidalflat stays bare with scattered water, no mosaic. Mud holds
+                            // its water in pools; sand drains, leaving only the odd one.
                             if wetland_type == "tidalflat" {
-                                if rng.random_bool(0.3) {
+                                // Pools only form in the mud: all over a mud flat, in the
+                                // damp hollows of a sandy one.
+                                let puddles = if block_type == MUD { 0.3 } else { 0.12 };
+                                if rng.random_bool(puddles) {
                                     editor.set_block(WATER, x, 0, z, Some(&[MUD]), None);
                                 }
                                 continue;
@@ -786,6 +819,19 @@ pub fn generate_natural_from_relation(
     }
 }
 
+fn is_tidal_flat(tags: &std::collections::HashMap<String, String>) -> bool {
+    tags.get("wetland").map(String::as_str) == Some("tidalflat")
+}
+
+/// Ground of a `wetland=tidalflat`: mud, unless its `surface=*` says sand or shingle.
+fn tidal_flat_block(surface: Option<&String>) -> Block {
+    match surface.map(String::as_str) {
+        Some("sand") => SAND,
+        Some("gravel" | "fine_gravel" | "pebblestone" | "pebbles" | "shingle" | "stones") => GRAVEL,
+        _ => MUD,
+    }
+}
+
 /// Ground of a `natural=beach` or `shoal`, from its `surface=*`: sand unless mapped otherwise.
 fn beach_block(surface: Option<&String>) -> Block {
     match surface.map(String::as_str) {
@@ -954,9 +1000,53 @@ mod tests {
     fn a_gravel_beach_is_gravel_and_a_plain_beach_is_sand() {
         let place = LLBBox::new(54.6, 9.9, 54.61, 9.91).unwrap();
         let gravel = render_natural(place, &[("natural", "beach"), ("surface", "gravel")]);
-        assert_eq!(count(&gravel, 0, &[GRAVEL]), 1600);
+        assert_eq!(
+            count(&gravel, 0, &[GRAVEL, ANDESITE, TUFF, DIORITE, COBBLESTONE]),
+            1600
+        );
         let sand = render_natural(place, &[("natural", "beach")]);
         assert_eq!(count(&sand, 0, &[SAND]), 1600);
+    }
+
+    #[test]
+    fn a_sandy_tidal_flat_is_sand_with_few_pools_and_a_plain_one_is_mud() {
+        let place = LLBBox::new(54.6, 9.9, 54.61, 9.91).unwrap();
+        let flat = [("natural", "wetland"), ("wetland", "tidalflat")];
+
+        let sandy = render_natural(place, &[flat[0], flat[1], ("surface", "sand")]);
+        let pools = count(&sandy, 0, &[WATER]);
+        assert_eq!(count(&sandy, 0, &[SAND, MUD, CLAY, WATER]), 1600);
+        assert!(pools < 160, "{pools} pools on sand");
+
+        let muddy = render_natural(place, &flat);
+        assert_eq!(count(&muddy, 0, &[MUD, CLAY, WATER]), 1600);
+        assert!(count(&muddy, 0, &[WATER]) > 300);
+    }
+
+    #[test]
+    fn shingle_mixes_pebbles_and_chalk_is_white() {
+        let place = LLBBox::new(54.6, 9.9, 54.61, 9.91).unwrap();
+        let shingle = render_natural(place, &[("natural", "beach"), ("surface", "shingle")]);
+        assert_eq!(
+            count(&shingle, 0, &[GRAVEL, ANDESITE, TUFF, DIORITE, COBBLESTONE]),
+            1600
+        );
+        assert!(count(&shingle, 0, &[TUFF, DIORITE]) > 50);
+
+        let chalk = render_natural(place, &[("natural", "bare_rock"), ("rock", "chalk")]);
+        assert!(count(&chalk, 0, &[CALCITE]) > 0);
+        assert_eq!(count(&chalk, 0, &[COBBLESTONE, COARSE_DIRT]), 0);
+
+        // Rock of no known kind gets the varied stone mix, not a flat stone sheet.
+        let plain = render_natural(place, &[("natural", "bare_rock")]);
+        assert!(count(&plain, 0, &[STONE]) < 1600);
+        assert!(
+            count(
+                &plain,
+                0,
+                &[ANDESITE, COBBLESTONE, GRAVEL, TUFF, COARSE_DIRT]
+            ) > 0
+        );
     }
 
     #[test]

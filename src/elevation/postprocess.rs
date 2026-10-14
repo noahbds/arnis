@@ -1,4 +1,4 @@
-use crate::land_cover::{LandCoverData, LC_BEACH, LC_BUILT_UP, LC_WATER};
+use crate::land_cover::{LandCoverData, LC_BUILT_UP, LC_FORESHORE, LC_MUDFLAT, LC_WATER};
 use fnv::{FnvHashMap, FnvHashSet};
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -309,8 +309,10 @@ pub fn apply_land_cover_repair(
 /// * in low-lying water that runs off the edge of the area (the sea, an
 ///   estuary, a river mouth), water is kept only where it is close to the
 ///   lowest ground around it: channels stay wet, the banks above them become
-///   beach. Up an estuary the channel bed sits above the sea level, so the
-///   altitude alone cannot tell a channel from a sand bank; its neighbourhood can;
+///   foreshore. Up an estuary the channel bed sits above the sea level, so the
+///   altitude alone cannot tell a channel from a sand bank; its neighbourhood can.
+///   The foreshore close above the channels and away from the open sea is mud,
+///   the rest sand;
 /// * every other water body (an inland lake, a pond, a river far above the
 ///   sea) is left as it was.
 ///
@@ -329,6 +331,11 @@ fn apply_sea_level(
     // its floor water may still stand (wavelets, survey noise, a sloping bed).
     const CHANNEL_RADIUS_M: f64 = 150.0;
     const CHANNEL_DEPTH_M: f64 = 0.5;
+    // Ground less than this above the channel floor stays wet between tides and
+    // holds silt; higher banks drain to sand.
+    const MUD_RISE_M: f64 = 1.2;
+    // Breaking waves keep the foreshore sandy this far from the open sea.
+    const SURF_ZONE_M: f64 = 300.0;
 
     let h = heights.len();
     let w = heights.first().map_or(0, Vec::len);
@@ -440,14 +447,45 @@ fn apply_sea_level(
         }
     }
 
+    // 3. Where the uncovered ground is mud: low, just above the channels, and out of
+    // reach of the waves. Within the surf zone the tide works the flat into sand.
+    let surf_reach = (SURF_ZONE_M / m_per_cell.max(1e-6)).round().max(1.0) as u32;
+    let mut surf_distance = vec![vec![u32::MAX; w]; h];
+    for y in 0..h {
+        for x in 0..w {
+            if sea[y][x] {
+                surf_distance[y][x] = 0;
+                queue.push_back((x, y));
+            }
+        }
+    }
+    while let Some((x, y)) = queue.pop_front() {
+        let d = surf_distance[y][x];
+        if d >= surf_reach {
+            continue;
+        }
+        for (nx, ny) in neighbours(x, y) {
+            if surf_distance[ny][nx] == u32::MAX {
+                surf_distance[ny][nx] = d + 1;
+                queue.push_back((nx, ny));
+            }
+        }
+    }
+
     let mut foreshore = 0usize;
     for y in 0..h {
         for x in 0..w {
             if !tidal[y][x] || sea[y][x] || !surveyed(x, y) || !heights[y][x].is_finite() {
                 continue;
             }
-            if heights[y][x] > channel_floor[y][x] + CHANNEL_DEPTH_M {
-                lc_grid[y][x] = LC_BEACH;
+            let rise = heights[y][x] - channel_floor[y][x];
+            if rise > CHANNEL_DEPTH_M {
+                let sheltered = surf_distance[y][x] > surf_reach;
+                lc_grid[y][x] = if sheltered && rise <= MUD_RISE_M {
+                    LC_MUDFLAT
+                } else {
+                    LC_FORESHORE
+                };
                 foreshore += 1;
             }
         }
@@ -4372,7 +4410,7 @@ mod sea_level_tests {
         for y in 0..3 {
             assert_eq!(lc[y][0..2], [LC_WATER, LC_WATER]);
             assert_eq!(heights[y][0..2], [0.0, 0.0]);
-            assert_eq!(lc[y][2..4], [LC_BEACH, LC_BEACH]);
+            assert_eq!(lc[y][2..4], [LC_FORESHORE, LC_FORESHORE]);
             assert_eq!(heights[y][2], 1.5, "uncovered ground keeps its altitude");
             assert_eq!(lc[y][4], LC_GRASSLAND);
         }
@@ -4420,9 +4458,36 @@ mod sea_level_tests {
         assert_eq!(foreshore, 12);
         for y in 0..3 {
             assert_eq!(lc[y][2..4], [LC_WATER, LC_WATER]);
-            assert_eq!(lc[y][0..2], [LC_BEACH, LC_BEACH]);
-            assert_eq!(lc[y][4..6], [LC_BEACH, LC_BEACH]);
+            assert_eq!(lc[y][0..2], [LC_FORESHORE, LC_FORESHORE]);
+            assert_eq!(lc[y][4..6], [LC_FORESHORE, LC_FORESHORE]);
         }
+    }
+
+    #[test]
+    fn low_sheltered_flats_are_mud_and_high_banks_sand() {
+        // Up an estuary, no open sea in reach: a channel at +1 m, a low flat at
+        // +1.8 m beside it, a high bank at +3 m.
+        let row: &[f64] = &[3.0, 1.8, 1.0, 1.0, 1.8, 3.0, 7.0];
+        let (mut heights, mut lc, survey) = area(&[(row, "wwwwww."), (row, "wwwwww.")]);
+
+        apply_sea_level(&mut heights, &mut lc, &survey, 0.0, 1.0);
+
+        assert_eq!(lc[0][1], LC_MUDFLAT);
+        assert_eq!(lc[0][4], LC_MUDFLAT);
+        assert_eq!(lc[0][0], LC_FORESHORE);
+        assert_eq!(lc[0][5], LC_FORESHORE);
+        assert_eq!(lc[0][2], LC_WATER);
+    }
+
+    #[test]
+    fn the_same_low_flat_next_to_the_open_sea_is_sand() {
+        // Open sea at the edge, then a low flat that would be mud up an estuary.
+        let row: &[f64] = &[-1.0, -1.0, 1.0, 1.0, 7.0];
+        let (mut heights, mut lc, survey) = area(&[(row, "wwww."), (row, "wwww.")]);
+
+        apply_sea_level(&mut heights, &mut lc, &survey, 0.0, 1.0);
+
+        assert_eq!(lc[0][2..4], [LC_FORESHORE, LC_FORESHORE]);
     }
 
     #[test]
