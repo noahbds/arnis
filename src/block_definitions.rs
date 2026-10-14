@@ -1612,6 +1612,7 @@ pub fn get_stair_block_for_material(material: Block) -> Block {
         // Dark stone family
         DEEPSLATE => DEEPSLATE_BRICK_STAIRS,
         DEEPSLATE_BRICKS => DEEPSLATE_BRICK_STAIRS,
+        DEEPSLATE_TILES => DEEPSLATE_BRICK_STAIRS,
         POLISHED_DEEPSLATE => POLISHED_DEEPSLATE_STAIRS,
         COBBLED_DEEPSLATE => DEEPSLATE_BRICK_STAIRS,
         BLACKSTONE => POLISHED_BLACKSTONE_BRICK_STAIRS,
@@ -1701,6 +1702,9 @@ pub fn get_slab_block_for_material(material: Block) -> Block {
     match material {
         STONE_BRICKS | CHISELED_STONE_BRICKS | CRACKED_STONE_BRICKS => STONE_BRICK_SLAB,
         BRICK | BROWN_TERRACOTTA | BROWN_CONCRETE_POWDER => BRICK_SLAB,
+        // Clay tile and slate roofs keep their colour at the eaves and ridge.
+        TERRACOTTA | RED_TERRACOTTA | GRANITE => BRICK_SLAB,
+        DEEPSLATE_TILES | DEEPSLATE_BRICKS | POLISHED_DEEPSLATE => DEEPSLATE_TILE_SLAB,
         MUD_BRICKS | WHITE_TERRACOTTA | GRAY_TERRACOTTA | LIGHT_BLUE_TERRACOTTA => MUD_BRICK_SLAB,
         OAK_PLANKS | OAK_LOG | SPRUCE_PLANKS | DARK_OAK_PLANKS => OAK_SLAB,
         QUARTZ_BLOCK | QUARTZ_BRICKS | WHITE_CONCRETE => QUARTZ_SLAB_TOP,
@@ -1880,7 +1884,8 @@ pub fn get_wall_block_for_material(material: &str, rng: &mut impl rand::Rng) -> 
         .collect();
 
     let options: &[Block] = match normalized.as_str() {
-        "brick" | "bricks" | "redbrick" => &[BRICK, NETHER_BRICK],
+        // Mostly red-brown brick; nether brick is near black and reads as soot.
+        "brick" | "bricks" | "redbrick" => &[BRICK, BRICK, BRICK, RED_TERRACOTTA],
         // `hard` and `block` are among the most common building:material values.
         "stone" | "naturalstone" | "hard" => &[STONE_BRICKS, COBBLESTONE, SMOOTH_STONE, ANDESITE],
         "limestone" => &[SMOOTH_STONE, POLISHED_ANDESITE, WHITE_TERRACOTTA],
@@ -1970,9 +1975,12 @@ pub fn get_roof_block_for_material(material: &str, rng: &mut impl rand::Rng) -> 
         }
         "tile" | "tiles" | "rooftile" | "rooftiles" | "ceramic" | "ceramictiles" | "claytile"
         | "claytiles" | "cementtile" | "terracotta" => {
-            &[BRICK, NETHER_BRICK, RED_NETHER_BRICKS, MUD_BRICKS]
+            // Orange-red clay, not the near-black of nether bricks: brick for the
+            // classic red, granite (salmon stairs) and terracotta for the paler ones.
+            &[BRICK, BRICK, GRANITE, TERRACOTTA]
         }
-        "slate" | "slates" => &[POLISHED_BLACKSTONE, DEEPSLATE_BRICKS, BLACKSTONE],
+        // Blue-grey deepslate reads as slate; blackstone only for the darkest.
+        "slate" | "slates" => &[DEEPSLATE_TILES, DEEPSLATE_BRICKS, POLISHED_BLACKSTONE],
         "metal"
         | "steel"
         | "aluminium"

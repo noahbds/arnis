@@ -11,6 +11,8 @@ mod buildings;
 mod coverage;
 mod foreshore;
 mod geology;
+mod ortho;
+mod roofs;
 mod wfs;
 
 pub use buildings::IgnBuildings;
@@ -67,7 +69,16 @@ fn fetch_ign_data_inner(
     let started = std::time::Instant::now();
     let features = wfs::fetch_features(&client, BUILDINGS_LAYER, bbox)?;
     let (transformer, xzbbox) = projection.transformer(bbox)?;
-    let buildings = IgnBuildings::from_features(&features, &transformer);
+    // Roof shapes need blocks that map linearly to lat/lon, as in the local projection.
+    let surface = (projection.kind == crate::projection::ProjectionKind::Local)
+        .then(|| roofs::SurfaceHeights::fetch(&client, bbox, &xzbbox))
+        .flatten();
+    let colours = (projection.kind == crate::projection::ProjectionKind::Local)
+        .then(|| ortho::RoofColours::fetch(&client, bbox, &xzbbox))
+        .flatten();
+    let buildings = IgnBuildings::from_features(&features, &transformer)
+        .with_surface(surface)
+        .with_colours(colours);
 
     // The foreshore is a bonus on top of the heights: its failure costs only itself.
     let elements = match wfs::fetch_features(&client, FORESHORE_LAYER, bbox) {
@@ -106,6 +117,22 @@ fn fetch_ign_data_inner(
         println!(
             "IGN: {} foreshore areas (shingle, rock, mud)",
             elements.len()
+        );
+        println!(
+            "IGN: aerial photograph {}",
+            if buildings.has_colours() {
+                "loaded"
+            } else {
+                "unavailable"
+            }
+        );
+        println!(
+            "IGN: LiDAR roof heights {}",
+            if buildings.has_surface() {
+                "loaded"
+            } else {
+                "unavailable"
+            }
         );
     }
     Ok(IgnData {

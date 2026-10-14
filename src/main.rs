@@ -605,10 +605,28 @@ fn run_cli() {
         elements: ign_elements,
     } = ign_data;
     let ign_enriched = ign_buildings.apply(&mut parsed_elements);
-    if ign_enriched > 0 {
+    if ign_enriched.heights > 0 {
         println!(
             "  Filled heights on {} OSM buildings from IGN BD TOPO",
-            ign_enriched.to_string().bright_white().bold()
+            ign_enriched.heights.to_string().bright_white().bold()
+        );
+    }
+    if ign_enriched.roofs > 0 {
+        println!(
+            "  Read roof shapes of {} OSM buildings from the IGN LiDAR",
+            ign_enriched.roofs.to_string().bright_white().bold()
+        );
+    }
+    if ign_enriched.roof_colours > 0 {
+        println!(
+            "  Read roof colours of {} OSM buildings from IGN aerial photographs",
+            ign_enriched.roof_colours.to_string().bright_white().bold()
+        );
+    }
+    if ign_enriched.looks > 0 {
+        println!(
+            "  Filled type, materials or age on {} OSM buildings from IGN BD TOPO",
+            ign_enriched.looks.to_string().bright_white().bold()
         );
     }
 

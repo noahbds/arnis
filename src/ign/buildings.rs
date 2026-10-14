@@ -1,14 +1,15 @@
-//! Building heights from the BD TOPO, the French national topographic database.
+//! Building heights and looks from the BD TOPO, the French national topographic database.
 //!
 //! OpenStreetMap in France has nearly every footprint (imported from the land
-//! registry) but almost never a height, so the generator has to guess one. The
-//! BD TOPO measures it. There is no identifier shared with OSM, and the two
-//! databases do not cut blocks into buildings the same way, so an OSM building
-//! is matched to whatever BD TOPO objects cover its footprint and takes their
-//! height weighted by how much of it each one covers.
+//! registry) but almost never a height, a type or a material, so the generator
+//! has to guess them. The BD TOPO records them. There is no identifier shared
+//! with OSM, and the two databases do not cut blocks into buildings the same
+//! way, so an OSM building is matched to whatever BD TOPO objects cover its
+//! footprint: it takes their height weighted by how much of it each one covers,
+//! and the type, materials and age of the one covering most of it.
 //!
-//! Strictly additive, like the Overture hints: an element that already carries
-//! `height` or `building:levels` is left alone.
+//! Strictly additive, like the Overture hints: a tag OSM already has is never
+//! replaced, and `building=yes` is the only building type that gets refined.
 
 use crate::coordinate_system::geographic::LLPoint;
 use crate::coordinate_system::transformation::CoordTransformer;
@@ -21,6 +22,8 @@ use std::collections::HashMap;
 const MIN_COVERAGE: f64 = 0.5;
 /// Sample points aimed for per footprint; coverage is measured on these.
 const TARGET_SAMPLES: f64 = 120.0;
+/// Sample points aimed for when reading a roof: small houses need half-block steps.
+const ROOF_SAMPLES: f64 = 200.0;
 /// Plausibility window for a measured eave height, in metres.
 const MIN_HEIGHT_M: f64 = 2.0;
 const MAX_HEIGHT_M: f64 = 500.0;
@@ -61,6 +64,108 @@ pub struct TopoBuilding {
     roof_rise_m: Option<f64>,
     /// Storeys including the ground floor.
     levels: Option<i64>,
+    /// Type, materials and age, as OSM tag values.
+    looks: Looks,
+}
+
+/// What a BD TOPO building says about how it looks, as OSM tag values.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Looks {
+    /// `building=*` refinement for an OSM `building=yes`.
+    kind: Option<&'static str>,
+    /// `building:material`
+    wall: Option<&'static str>,
+    /// `roof:material`
+    roof: Option<&'static str>,
+    /// `start_date`: year the building first appears.
+    year: Option<i32>,
+}
+
+impl Looks {
+    fn is_empty(&self) -> bool {
+        *self == Looks::default()
+    }
+
+    fn from_properties(props: &Value, levels: Option<i64>) -> Self {
+        let text = |key: &str| props.get(key).and_then(Value::as_str);
+        Self {
+            kind: building_kind(
+                text("nature"),
+                text("usage_1"),
+                props.get("nombre_de_logements").and_then(Value::as_i64),
+                levels,
+            ),
+            wall: text("materiaux_des_murs").and_then(wall_material),
+            roof: text("materiaux_de_la_toiture").and_then(roof_material),
+            year: text("date_d_apparition")
+                .and_then(|d| d.get(..4))
+                .and_then(|y| y.parse::<i32>().ok())
+                .filter(|y| (1000..=2100).contains(y)),
+        }
+    }
+}
+
+/// Wall material from the land-registry code the BD TOPO carries: the first
+/// digit is the main material (1 stone, 2 millstone, 3 concrete, 4 brick,
+/// 5 breeze block, 6 wood, 9 other, 0 unknown). The table is the land
+/// registry's; on the Picardy coast brick dominates, as it should.
+fn wall_material(code: &str) -> Option<&'static str> {
+    match code.chars().next()? {
+        '1' | '2' => Some("stone"),
+        '3' => Some("concrete"),
+        '4' => Some("brick"),
+        '5' => Some("cement_block"),
+        '6' => Some("wood"),
+        _ => None,
+    }
+}
+
+/// Roof material from the same registry: 1 tiles, 2 slate, 3 zinc or
+/// aluminium, 4 concrete, 9 other, 0 unknown.
+fn roof_material(code: &str) -> Option<&'static str> {
+    match code.chars().next()? {
+        '1' => Some("roof_tiles"),
+        '2' => Some("slate"),
+        '3' => Some("zinc"),
+        '4' => Some("concrete"),
+        _ => None,
+    }
+}
+
+/// `building=*` for a BD TOPO nature and use, or `None` where they say nothing
+/// more than `yes`.
+fn building_kind(
+    nature: Option<&str>,
+    usage: Option<&str>,
+    dwellings: Option<i64>,
+    levels: Option<i64>,
+) -> Option<&'static str> {
+    match nature {
+        Some("Eglise") => return Some("church"),
+        Some("Chapelle") => return Some("chapel"),
+        Some("Château") => return Some("castle"),
+        Some("Fort, blockhaus, casemate") => return Some("bunker"),
+        Some("Tour, donjon") => return Some("tower"),
+        Some("Serre") => return Some("greenhouse"),
+        Some("Silo") => return Some("silo"),
+        _ => {}
+    }
+    match usage? {
+        // Flats from three dwellings or three storeys up; a house below that.
+        "Résidentiel" => match (dwellings, levels) {
+            (Some(d), _) if d >= 3 => Some("apartments"),
+            (_, Some(l)) if l >= 3 => Some("apartments"),
+            (Some(_), _) | (_, Some(_)) => Some("house"),
+            _ => None,
+        },
+        "Annexe" => Some("shed"),
+        "Agricole" => Some("farm_auxiliary"),
+        "Commercial et services" => Some("commercial"),
+        "Industriel" => Some("industrial"),
+        "Religieux" => Some("religious"),
+        "Sportif" => Some("sports_hall"),
+        _ => None,
+    }
 }
 
 impl TopoBuilding {
@@ -69,6 +174,7 @@ impl TopoBuilding {
         eave_height_m: Option<f64>,
         roof_rise_m: Option<f64>,
         levels: Option<i64>,
+        looks: Looks,
     ) -> Option<Self> {
         let mut bounds = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
         for &(x, z) in polygons.iter().flat_map(|p| p.exterior.iter()) {
@@ -88,6 +194,7 @@ impl TopoBuilding {
             eave_height_m,
             roof_rise_m,
             levels,
+            looks,
         })
     }
 
@@ -117,7 +224,8 @@ impl TopoBuilding {
             .get("nombre_d_etages")
             .and_then(Value::as_i64)
             .filter(|l| (1..=MAX_LEVELS).contains(l));
-        if eave_height_m.is_none() && levels.is_none() {
+        let looks = Looks::from_properties(props, levels);
+        if eave_height_m.is_none() && levels.is_none() && looks.is_empty() {
             return None;
         }
 
@@ -153,7 +261,7 @@ impl TopoBuilding {
             "MultiPolygon" => coordinates.iter().filter_map(polygon).collect(),
             _ => return None,
         };
-        Self::new(polygons, eave_height_m, roof_rise_m, levels)
+        Self::new(polygons, eave_height_m, roof_rise_m, levels, looks)
     }
 
     fn contains(&self, p: Point) -> bool {
@@ -172,12 +280,30 @@ struct Hint {
     eave_height_m: Option<f64>,
     roof_rise_m: Option<f64>,
     levels: Option<i64>,
+    looks: Looks,
+}
+
+/// How many OSM buildings an [`IgnBuildings::apply`] enriched.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Enriched {
+    /// Given a height or storey count.
+    pub heights: usize,
+    /// Given a type, a material or a construction year.
+    pub looks: usize,
+    /// Given a roof shape read from the LiDAR.
+    pub roofs: usize,
+    /// Given a roof colour read from the aerial photographs.
+    pub roof_colours: usize,
 }
 
 /// The BD TOPO buildings of an area, ready to lend their heights to OSM buildings.
 #[derive(Default)]
 pub struct IgnBuildings {
     buildings: Vec<TopoBuilding>,
+    /// LiDAR heights above ground, to read roof shapes from where available.
+    surface: Option<super::roofs::SurfaceHeights>,
+    /// Aerial photograph, to read roof colours from where available.
+    colours: Option<super::ortho::RoofColours>,
 }
 
 impl IgnBuildings {
@@ -187,36 +313,72 @@ impl IgnBuildings {
                 .iter()
                 .filter_map(|f| TopoBuilding::from_feature(f, transformer))
                 .collect(),
+            surface: None,
+            colours: None,
         }
+    }
+
+    /// Reads roof colours from this photograph as well.
+    pub fn with_colours(mut self, colours: Option<super::ortho::RoofColours>) -> Self {
+        self.colours = colours;
+        self
+    }
+
+    pub fn has_colours(&self) -> bool {
+        self.colours.is_some()
+    }
+
+    /// Reads roof shapes from these LiDAR heights as well.
+    pub fn with_surface(mut self, surface: Option<super::roofs::SurfaceHeights>) -> Self {
+        self.surface = surface;
+        self
+    }
+
+    pub fn has_surface(&self) -> bool {
+        self.surface.is_some()
     }
 
     pub fn len(&self) -> usize {
         self.buildings.len()
     }
 
-    /// Fill `height` / `building:levels` on OSM buildings that carry neither.
-    /// Returns the number of elements enriched.
-    pub fn apply(&self, elements: &mut [ProcessedElement]) -> usize {
+    /// Fill height, storeys, type, materials and construction year on OSM
+    /// buildings, each only where OSM has nothing for it.
+    pub fn apply(&self, elements: &mut [ProcessedElement]) -> Enriched {
+        let mut enriched = Enriched::default();
         if self.buildings.is_empty() {
-            return 0;
+            return enriched;
         }
         let index = self.index();
 
-        let mut enriched = 0;
         for element in elements.iter_mut() {
             let tags = element.tags();
             if !tags.contains_key("building") && !tags.contains_key("building:part") {
                 continue;
             }
             // Any existing vertical tag means OSM already knows better.
-            if tags.contains_key("height") || tags.contains_key("building:levels") {
+            let wants_height =
+                !tags.contains_key("height") && !tags.contains_key("building:levels");
+            let wants_roof = self.surface.is_some() && !tags.contains_key("roof:shape");
+            let wants_colour = self.colours.is_some()
+                && !tags.contains_key("roof:material")
+                && !tags.contains_key("roof:colour");
+            if !wants_height && !wants_roof && !wants_colour && !wants_looks(tags) {
                 continue;
             }
             let Some(footprint) = Footprint::of(element) else {
                 continue;
             };
-            let Some(hint) = self.hint_for(&footprint, &index) else {
-                continue;
+            let roof = self
+                .surface
+                .as_ref()
+                .filter(|_| wants_roof)
+                .and_then(|surface| super::roofs::classify(&footprint.interior_samples(), surface));
+            let hint = match (self.hint_for(&footprint, &index), roof) {
+                (Some(hint), _) => hint,
+                // The LiDAR alone still gives the roof.
+                (None, Some(_)) => Hint::default(),
+                (None, None) => continue,
             };
 
             let tags: &mut HashMap<String, String> = match element {
@@ -224,8 +386,47 @@ impl IgnBuildings {
                 ProcessedElement::Relation(relation) => &mut relation.tags,
                 ProcessedElement::Node(_) => continue,
             };
-            if write_tags(tags, hint) {
-                enriched += 1;
+            // The roof first, so the height below knows whether it is pitched.
+            let mut hint = hint;
+            if let Some(roof) = roof {
+                tags.insert("roof:shape".to_string(), roof.shape.to_string());
+                if let Some(orientation) = roof.orientation {
+                    tags.entry("roof:orientation".to_string())
+                        .or_insert_with(|| orientation.to_string());
+                }
+                if let Some(direction) = roof.direction {
+                    tags.entry("roof:direction".to_string())
+                        .or_insert_with(|| direction.to_string());
+                }
+                if roof.shape != "flat" {
+                    tags.entry("roof:height".to_string())
+                        .or_insert_with(|| format!("{:.1}", roof.rise_m));
+                    // Measured on this very roof, it beats the BD TOPO's figure.
+                    hint.roof_rise_m = Some(roof.rise_m);
+                }
+                tags.insert("arnis:roof_source".to_string(), "ign_lidar_hd".to_string());
+                enriched.roofs += 1;
+            }
+            if wants_height && write_tags(tags, hint) {
+                enriched.heights += 1;
+            }
+            if write_looks(tags, hint.looks) {
+                enriched.looks += 1;
+            }
+            // Only where neither OSM nor the BD TOPO said what the roof is made of.
+            if let Some(colours) = self.colours.as_ref() {
+                if !tags.contains_key("roof:material") && !tags.contains_key("roof:colour") {
+                    if let Some(colour) =
+                        super::ortho::roof_colour(&footprint.interior_samples(), colours)
+                    {
+                        tags.insert("roof:colour".to_string(), colour);
+                        tags.insert(
+                            "arnis:roof_colour_source".to_string(),
+                            "ign_bd_ortho".to_string(),
+                        );
+                        enriched.roof_colours += 1;
+                    }
+                }
             }
         }
         enriched
@@ -293,11 +494,19 @@ impl IgnBuildings {
             // Ties broken on the index so the pick does not depend on map order.
             .max_by_key(|&(count, i, _)| (count, std::cmp::Reverse(i)))
             .map(|(_, _, levels)| levels);
+        // Type and materials are not averaged either: they are those of the
+        // object that covers most of the footprint.
+        let looks = covered
+            .iter()
+            .max_by_key(|&(&i, &count)| (count, std::cmp::Reverse(i)))
+            .map(|(&i, _)| self.buildings[i as usize].looks)
+            .unwrap_or_default();
 
         Some(Hint {
             eave_height_m: weighted(|b| b.eave_height_m),
             roof_rise_m: weighted(|b| b.roof_rise_m),
             levels,
+            looks,
         })
     }
 }
@@ -344,6 +553,67 @@ fn write_tags(tags: &mut HashMap<String, String>, hint: Hint) -> bool {
     true
 }
 
+/// Whether OSM leaves any of the looks unsaid on a building.
+fn wants_looks(tags: &HashMap<String, String>) -> bool {
+    let missing = |keys: &[&str]| !keys.iter().any(|k| tags.contains_key(*k));
+    tags.get("building").map(String::as_str) == Some("yes")
+        || missing(&[
+            "building:material",
+            "building:facade:material",
+            "facade:material",
+            "building:colour",
+            "colour",
+        ])
+        || missing(&["roof:material", "roof:colour"])
+        || missing(&["start_date", "construction_date"])
+}
+
+/// Writes the looks where OSM has nothing. Returns whether anything was written.
+fn write_looks(tags: &mut HashMap<String, String>, looks: Looks) -> bool {
+    let missing =
+        |tags: &HashMap<String, String>, keys: &[&str]| !keys.iter().any(|k| tags.contains_key(*k));
+    let mut written = false;
+    let mut set = |tags: &mut HashMap<String, String>, key: &str, value: String| {
+        tags.insert(key.to_string(), value);
+        written = true;
+    };
+    if let Some(kind) = looks.kind {
+        // Only a plain `building=yes` is refined; parts keep their own tagging.
+        if tags.get("building").map(String::as_str) == Some("yes") {
+            set(tags, "building", kind.to_string());
+        }
+    }
+    if let Some(wall) = looks.wall {
+        // A mapped colour already decides the wall; a material would override it.
+        if missing(
+            tags,
+            &[
+                "building:material",
+                "building:facade:material",
+                "facade:material",
+                "building:colour",
+                "colour",
+            ],
+        ) {
+            set(tags, "building:material", wall.to_string());
+        }
+    }
+    if let Some(roof) = looks.roof {
+        if missing(tags, &["roof:material", "roof:colour"]) {
+            set(tags, "roof:material", roof.to_string());
+        }
+    }
+    if let Some(year) = looks.year {
+        if missing(tags, &["start_date", "construction_date"]) {
+            set(tags, "start_date", year.to_string());
+        }
+    }
+    if written {
+        tags.insert("arnis:looks_source".to_string(), "ign_bdtopo".to_string());
+    }
+    written
+}
+
 /// The ground an OSM building stands on: its outer rings minus its inner ones.
 struct Footprint {
     outers: Vec<Vec<Point>>,
@@ -386,11 +656,33 @@ impl Footprint {
         (!footprint.outers.is_empty()).then_some(footprint)
     }
 
+    /// Samples at least half a block inside the outline, clear of the walls and
+    /// the ground beside them that the LiDAR mixes in at the edge.
+    fn interior_samples(&self) -> Vec<Point> {
+        let inside = |p: Point| {
+            self.outers.iter().any(|o| point_in_ring(p, o))
+                && !self.inners.iter().any(|i| point_in_ring(p, i))
+        };
+        self.samples_at(ROOF_SAMPLES, 0.5)
+            .into_iter()
+            .filter(|&(x, z)| {
+                [(0.5, 0.0), (-0.5, 0.0), (0.0, 0.5), (0.0, -0.5)]
+                    .iter()
+                    .all(|&(dx, dz)| inside((x + dx, z + dz)))
+            })
+            .collect()
+    }
+
     /// Points spread evenly over the footprint, about `TARGET_SAMPLES` of them.
     fn samples(&self) -> Vec<Point> {
-        let area: f64 = self.outers.iter().map(|r| ring_area(r)).sum();
         // Never finer than a block: coordinates are whole blocks to begin with.
-        let step = (area / TARGET_SAMPLES).sqrt().max(1.0);
+        self.samples_at(TARGET_SAMPLES, 1.0)
+    }
+
+    /// About `target` points spread evenly, no closer than `min_step` blocks.
+    fn samples_at(&self, target: f64, min_step: f64) -> Vec<Point> {
+        let area: f64 = self.outers.iter().map(|r| ring_area(r)).sum();
+        let step = (area / target).sqrt().max(min_step);
         let mut samples = Vec::new();
         for outer in &self.outers {
             let (mut min_x, mut min_z, mut max_x, mut max_z) =
@@ -475,11 +767,15 @@ mod tests {
             exterior: rect(bounds.0, bounds.1, bounds.2, bounds.3),
             holes: Vec::new(),
         };
-        TopoBuilding::new(vec![polygon], eave, rise, levels).unwrap()
+        TopoBuilding::new(vec![polygon], eave, rise, levels, Looks::default()).unwrap()
     }
 
     fn ign(buildings: Vec<TopoBuilding>) -> IgnBuildings {
-        IgnBuildings { buildings }
+        IgnBuildings {
+            buildings,
+            surface: None,
+            colours: None,
+        }
     }
 
     fn nodes(ring: &[(i32, i32)]) -> Vec<ProcessedNode> {
@@ -524,7 +820,7 @@ mod tests {
         )]);
         let mut elements = vec![building(1, (0, 0, 10, 10), &[("building", "yes")])];
 
-        assert_eq!(data.apply(&mut elements), 1);
+        assert_eq!(data.apply(&mut elements).heights, 1);
         assert_eq!(tag(&elements[0], "height"), Some("12.4"));
         assert_eq!(tag(&elements[0], "building:levels"), Some("4"));
         assert_eq!(tag(&elements[0], "arnis:height_source"), Some("ign_bdtopo"));
@@ -547,7 +843,7 @@ mod tests {
             ),
         ];
 
-        assert_eq!(data.apply(&mut elements), 0);
+        assert_eq!(data.apply(&mut elements).heights, 0);
         assert_eq!(tag(&elements[0], "height"), Some("30"));
         assert_eq!(tag(&elements[1], "height"), None);
         assert_eq!(tag(&elements[1], "building:levels"), Some("9"));
@@ -558,7 +854,7 @@ mod tests {
         let data = ign(vec![topo((0.0, 0.0, 10.0, 10.0), Some(12.4), None, None)]);
         let mut elements = vec![building(1, (0, 0, 10, 10), &[("landuse", "grass")])];
 
-        assert_eq!(data.apply(&mut elements), 0);
+        assert_eq!(data.apply(&mut elements).heights, 0);
         assert_eq!(tag(&elements[0], "height"), None);
     }
 
@@ -568,7 +864,7 @@ mod tests {
         let data = ign(vec![topo((0.0, 0.0, 4.0, 20.0), Some(15.0), None, None)]);
         let mut elements = vec![building(1, (0, 0, 20, 20), &[("building", "yes")])];
 
-        assert_eq!(data.apply(&mut elements), 0);
+        assert_eq!(data.apply(&mut elements).heights, 0);
     }
 
     #[test]
@@ -580,7 +876,7 @@ mod tests {
         ]);
         let mut elements = vec![building(1, (0, 0, 40, 20), &[("building", "yes")])];
 
-        assert_eq!(data.apply(&mut elements), 1);
+        assert_eq!(data.apply(&mut elements).heights, 1);
         let height: f64 = tag(&elements[0], "height").unwrap().parse().unwrap();
         assert!((height - 12.5).abs() < 0.6, "height {height}");
     }
@@ -593,7 +889,7 @@ mod tests {
             building(2, (20, 0, 40, 10), &[("building", "house")]),
         ];
 
-        assert_eq!(data.apply(&mut elements), 2);
+        assert_eq!(data.apply(&mut elements).heights, 2);
         assert_eq!(tag(&elements[0], "height"), Some("9.0"));
         assert_eq!(tag(&elements[1], "height"), Some("9.0"));
     }
@@ -609,7 +905,7 @@ mod tests {
         )]);
         let mut elements = vec![building(1, (0, 0, 10, 10), &[("building", "yes")])];
 
-        assert_eq!(data.apply(&mut elements), 1);
+        assert_eq!(data.apply(&mut elements).heights, 1);
         assert_eq!(tag(&elements[0], "height"), Some("20.0"));
         assert_eq!(tag(&elements[0], "building:levels"), None);
     }
@@ -619,7 +915,7 @@ mod tests {
         let data = ign(vec![topo((0.0, 0.0, 10.0, 10.0), None, None, Some(3))]);
         let mut elements = vec![building(1, (0, 0, 10, 10), &[("building", "yes")])];
 
-        assert_eq!(data.apply(&mut elements), 1);
+        assert_eq!(data.apply(&mut elements).heights, 1);
         assert_eq!(tag(&elements[0], "building:levels"), Some("3"));
         assert_eq!(tag(&elements[0], "height"), None);
     }
@@ -646,7 +942,7 @@ mod tests {
             ),
         ];
 
-        assert_eq!(data.apply(&mut elements), 3);
+        assert_eq!(data.apply(&mut elements).heights, 3);
         // Unmapped roof: the eave height is the wall height.
         assert_eq!(tag(&elements[0], "height"), Some("6.0"));
         assert_eq!(tag(&elements[0], "roof:height"), None);
@@ -667,12 +963,13 @@ mod tests {
             Some(18.0),
             None,
             None,
+            Looks::default(),
         )
         .unwrap();
         let data = ign(vec![ring_building]);
         let mut elements = vec![building(1, (12, 12, 28, 28), &[("building", "yes")])];
 
-        assert_eq!(data.apply(&mut elements), 0);
+        assert_eq!(data.apply(&mut elements).heights, 0);
     }
 
     #[test]
@@ -688,8 +985,98 @@ mod tests {
         };
         let mut elements = vec![ProcessedElement::Relation(relation)];
 
-        assert_eq!(data.apply(&mut elements), 1);
+        assert_eq!(data.apply(&mut elements).heights, 1);
         assert_eq!(tag(&elements[0], "height"), Some("14.0"));
+    }
+
+    #[test]
+    fn looks_fill_only_what_osm_leaves_unsaid() {
+        let looks = Looks {
+            kind: Some("house"),
+            wall: Some("brick"),
+            roof: Some("slate"),
+            year: Some(1900),
+        };
+        let measured = TopoBuilding::new(
+            vec![Polygon {
+                exterior: rect(0.0, 0.0, 10.0, 10.0),
+                holes: Vec::new(),
+            }],
+            Some(7.0),
+            None,
+            None,
+            looks,
+        )
+        .unwrap();
+        let data = ign(vec![measured]);
+        let mut elements = vec![
+            building(1, (0, 0, 10, 10), &[("building", "yes")]),
+            building(
+                2,
+                (0, 0, 10, 10),
+                &[
+                    ("building", "church"),
+                    ("height", "12"),
+                    ("roof:colour", "red"),
+                    ("building:material", "stone"),
+                ],
+            ),
+        ];
+
+        let enriched = data.apply(&mut elements);
+
+        assert_eq!(
+            enriched,
+            Enriched {
+                heights: 1,
+                looks: 2,
+                roofs: 0,
+                roof_colours: 0
+            }
+        );
+        assert_eq!(tag(&elements[0], "building"), Some("house"));
+        assert_eq!(tag(&elements[0], "building:material"), Some("brick"));
+        assert_eq!(tag(&elements[0], "roof:material"), Some("slate"));
+        assert_eq!(tag(&elements[0], "start_date"), Some("1900"));
+        // A mapped type, height, colour and material all stand; only the year is new.
+        assert_eq!(tag(&elements[1], "building"), Some("church"));
+        assert_eq!(tag(&elements[1], "height"), Some("12"));
+        assert_eq!(tag(&elements[1], "roof:material"), None);
+        assert_eq!(tag(&elements[1], "building:material"), Some("stone"));
+        assert_eq!(tag(&elements[1], "start_date"), Some("1900"));
+    }
+
+    #[test]
+    fn registry_codes_and_uses_map_to_osm_values() {
+        assert_eq!(wall_material("41"), Some("brick"));
+        assert_eq!(wall_material("10"), Some("stone"));
+        assert_eq!(wall_material("00"), None);
+        assert_eq!(roof_material("20"), Some("slate"));
+        assert_eq!(roof_material("13"), Some("roof_tiles"));
+        assert_eq!(
+            building_kind(Some("Eglise"), Some("Religieux"), None, None),
+            Some("church")
+        );
+        assert_eq!(
+            building_kind(
+                Some("Indifférenciée"),
+                Some("Résidentiel"),
+                Some(12),
+                Some(5)
+            ),
+            Some("apartments")
+        );
+        assert_eq!(
+            building_kind(
+                Some("Indifférenciée"),
+                Some("Résidentiel"),
+                Some(1),
+                Some(2)
+            ),
+            Some("house")
+        );
+        assert_eq!(building_kind(None, Some("Résidentiel"), None, None), None);
+        assert_eq!(building_kind(None, Some("Indifférencié"), None, None), None);
     }
 
     #[test]
